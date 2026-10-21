@@ -1,0 +1,40 @@
+# redacter config. This file lists your PII: keep it private (mode 600)
+# and out of version control.
+
+# Exact strings to redact: names, addresses, employer names, dependents.
+# Case is ignored, any whitespace matches any whitespace, and periods/commas
+# after a word are optional ("Jane Q. Doe" also matches "JANE Q DOE").
+# List each way a name appears, e.g. "Doe, Jane" as well as "Jane Doe".
+terms = [
+    # "Jane Q. Doe",
+    # "Doe, Jane",
+    # "123 Main Street",
+    # "Springfield, IL 62704",
+]
+
+# Matches to never redact, e.g. the IRS's own phone number.
+allow = [
+    # "800-829-1040",
+]
+
+# Built-in detectors. Defaults shown.
+[patterns]
+ssn = true             # 123-45-6789 / 123 45 6789 (also ITINs)
+ein = true             # 12-3456789
+nine_digit = true      # bare 9 digits: undashed SSN/EIN, routing numbers
+account_number = true  # 10-17 digit runs: bank accounts
+phone = true
+email = true
+date = false           # 01/02/1980 -- off: tax forms are full of dates
+
+# Your own regexes (Python syntax, case-insensitive), as name = "regex".
+[custom]
+# ip_pin = '(?<!\d)\d{6}(?!\d)'
+
+# Extra rectangles to black out, for things text search can't see, such as
+# a signature image. page is 1-based; rect is [x0, y0, x1, y1] in PDF points
+# from the top-left corner (preview PNGs are rendered at 2x, so divide
+# pixel coordinates by 2).
+# [[boxes]]
+# page = 1
+# rect = [50, 700, 250, 730]

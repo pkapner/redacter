@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "redacter"
+version = "0.1.0"
+description = "Find and permanently remove PII from text-based PDFs (e.g. tax returns)"
+readme = "README.md"
+requires-python = ">=3.11"
+# PyMuPDF 2.0 mis-spaces the text that follows a redaction (it shifts left
+# by one glyph), so stay on 1.x until that is fixed.
+dependencies = ["pymupdf>=1.24.10,<2"]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.scripts]
+redacter = "redacter.cli:main"
+
+[tool.setuptools]
+packages = ["redacter"]
+
+[tool.setuptools.package-data]
+redacter = ["redact.example.toml"]

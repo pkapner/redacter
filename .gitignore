@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.egg-info/
+build/
+.pytest_cache/
+
+# Never commit your PII config, tax documents, or previews
+redact.toml
+*.pdf
+preview*/
+*.png
