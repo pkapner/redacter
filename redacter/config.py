@@ -12,9 +12,9 @@ from typing import Callable
 # match never starts or ends in the middle of a longer number.
 BUILTIN_PATTERNS: dict[str, str] = {
     # SSN or ITIN written with dashes or spaces: 123-45-6789, 123 45 6789
-    "ssn": r"(?<!\d)\d{3}(?:[ ]?-[ ]?|[ ])\d{2}(?:[ ]?-[ ]?|[ ])\d{4}(?!\d)",
+    "ssn": r"(?<!\d)\d{3}(?:[ ]*-[ ]*|[ ]+)\d{2}(?:[ ]*-[ ]*|[ ]+)\d{4}(?!\d)",
     # Employer ID number: 12-3456789
-    "ein": r"(?<!\d)\d{2}[ ]?-[ ]?\d{7}(?!\d)",
+    "ein": r"(?<!\d)\d{2}[ ]*-[ ]*\d{7}(?!\d)",
     # Bare 9-digit run: an undashed SSN/EIN/ITIN or a bank routing number
     "nine_digit": r"(?<![\d,.$])\d{9}(?![\d,]|\.\d)",
     # Bank account and similar long numbers

@@ -108,7 +108,14 @@ def page_text(page: pymupdf.Page) -> PageText:
         if out:
             out.append(Char("\n", None, r))
         prev = None
-        for c, bbox, size, origin in row:
+        dividers = _dividers(row) if row and row[0][3] is not None else set()
+        for i, (c, bbox, size, origin) in enumerate(row):
+            if i in dividers:
+                # Read a box divider as a space; leave its outline out of
+                # the match so it does not inflate the black box.
+                out.append(Char(" ", None, r))
+                prev = (" ", bbox)
+                continue
             if prev is not None and not prev[0].isspace() and not c.isspace():
                 gap = bbox.x0 - prev[1].x1
                 both_digits = prev[0].isdigit() and c.isdigit()
@@ -125,6 +132,27 @@ def page_text(page: pymupdf.Page) -> PageText:
             prev = (c, bbox)
 
     return PageText("".join(ch.c for ch in out), out)
+
+
+def _dividers(row: list) -> set[int]:
+    """Indices of glyphs in a sorted row that are box dividers, not text.
+
+    CCH draws the dotted lines between SSN boxes as big glyphs from a symbol
+    font ('"' in CCHSymbolTwo) on the same baseline as the digits, which
+    would otherwise read as 123 4"5 6"789. A divider is a non-alphanumeric
+    glyph at least 1.5x the size of the alphanumerics on both sides of it.
+    """
+    alnum = [i for i, ch in enumerate(row) if ch[0].isalnum()]
+    found = set()
+    for i, (c, _b, size, _o) in enumerate(row):
+        if c.isalnum() or c.isspace():
+            continue
+        left = [row[j][2] for j in alnum if j < i][-1:]
+        right = [row[j][2] for j in alnum if j > i][:1]
+        sides = left + right
+        if sides and all(size >= 1.5 * s for s in sides):
+            found.add(i)
+    return found
 
 
 def _fix_degenerate_boxes(row: list) -> None:

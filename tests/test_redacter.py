@@ -281,3 +281,39 @@ def test_zero_width_font_glyphs(tmp_path):
     assert "Keepthis" in text
     for secret in ["031176110", "36057570935", "6789", "KAPNER"]:
         assert secret not in text
+
+
+@pytest.mark.parametrize("divider_dy", [0, 3, -3])
+def test_ssn_with_divider_glyphs_between_boxes(tmp_path, divider_dy):
+    # CCH draws the dotted lines between SSN boxes as large symbol-font
+    # glyphs on the digits' baseline: 123 4"5 6"789 without special handling.
+    doc = pymupdf.open()
+    page = doc.new_page()
+    zw = doc.get_new_xref()
+    doc.update_object(zw, "<</Type/Font/Subtype/Type1/BaseFont/Courier/FirstChar 32"
+                      "/LastChar 126/Widths[" + " ".join(["0"] * 95) + "]>>")
+    sym = doc.get_new_xref()
+    doc.update_object(sym, "<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>")
+    res = doc.get_new_xref()
+    doc.update_object(res, f"<</Font<</ZW {zw} 0 R/SY {sym} 0 R>>>>")
+    doc.xref_set_key(page.xref, "Resources", f"{res} 0 R")
+    glyphs = " ".join(f"({c}) -600" for c in "123 45 6789")
+    body = (f"BT /ZW 9.8 Tf 475 700 Td [{glyphs}] TJ ET "
+            f"BT /SY 19.9 Tf 501 {700 + divider_dy} Td (\") Tj ET "
+            f"BT /SY 19.9 Tf 522 {700 + divider_dy} Td (\") Tj ET "
+            "BT /SY 7 Tf 472 715 Td (Your social security number) Tj ET")
+    contents = doc.get_new_xref()
+    doc.update_object(contents, "<<>>")
+    doc.update_stream(contents, body.encode())
+    doc.xref_set_key(page.xref, "Contents", f"{contents} 0 R")
+    src = tmp_path / "in.pdf"
+    doc.save(src)
+
+    found = find_matches(open_pdf(src), Config())
+    assert len(found) == 1 and found[0].kind in ("ssn", "spaced_digits")
+
+    out = tmp_path / "out.pdf"
+    assert main(["apply", str(src), "-o", str(out)]) == 0
+    text = "".join(all_text(out).split())
+    assert "Yoursocialsecuritynumber" in text
+    assert not any(d in text for d in "12346789")
