@@ -393,3 +393,64 @@ def test_config_round_trip(tmp_path):
     assert (back.terms, back.allow, back.patterns, back.custom) == (
         cfg.terms, cfg.allow, cfg.patterns, cfg.custom)
     assert back.boxes[0].page == 2 and back.boxes[0].rect == (10.0, 20.0, 30.5, 40.0)
+
+
+def test_identifying_metadata_is_stripped_everywhere(tmp_path):
+    """Names hidden in every non-content store of a PDF, including inside a
+    JPEG's EXIF/XMP/comment blocks, must all be gone after redaction."""
+    import re
+    import struct
+
+    def seg(marker, body):
+        return b"\xff" + bytes([marker]) + struct.pack(">H", len(body) + 2) + body
+
+    pix = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, 40, 40), False)
+    pix.set_rect(pix.irect, (200, 200, 200))
+    jpg = pix.tobytes("jpeg")
+    jpg = (jpg[:2] + seg(0xE1, b"Exif\x00\x00MM\x00\x2a\x00\x00\x00\x08 SecretExif")
+           + seg(0xE1, b"http://ns.adobe.com/xap/1.0/\x00 SecretXmp")
+           + seg(0xFE, b"SecretComment") + jpg[2:])
+
+    doc = pymupdf.open()
+    page = doc.new_page()
+    page.insert_text((50, 80), "Plain page text", fontsize=11)
+    page.insert_image(pymupdf.Rect(50, 100, 150, 200), stream=jpg)
+    doc.set_metadata({"author": "SecretInfo"})
+    doc.set_xml_metadata("<x:xmpmeta>SecretCatalogXmp</x:xmpmeta>")
+    cat = doc.pdf_catalog()
+    pm = doc.get_new_xref()
+    doc.update_object(pm, "<<>>")
+    doc.update_stream(pm, b"<x:xmpmeta>SecretPageXmp</x:xmpmeta>")
+    doc.xref_set_key(page.xref, "Metadata", f"{pm} 0 R")
+    doc.xref_set_key(page.xref, "LastModified", "(SecretLastMod)")
+    doc.xref_set_key(cat, "StructTreeRoot", "<</Type/StructTreeRoot/K <</S/P/Alt (SecretAlt)>> >>")
+    doc.xref_set_key(cat, "PageLabels", "<</Nums [0 <</P (SecretLabel)>>]>>")
+    doc.xref_set_key(cat, "Names", "<</Dests <</Names [(SecretDest) [3 0 R /Fit]]>>>>")
+    src = tmp_path / "in.pdf"
+    doc.save(src)
+    src_id = pymupdf.open(src).xref_get_key(-1, "ID")[1]
+
+    out = tmp_path / "out.pdf"
+    assert main(["apply", str(src), "-o", str(out)]) == 0
+    res = pymupdf.open(out)
+    blob = res.tobytes(expand=255) + b"".join(
+        res.xref_stream_raw(x) for x in range(1, res.xref_length()) if res.xref_is_stream(x))
+    assert re.findall(rb"Secret\w*", blob) == []
+    assert b"MuPDF" not in out.read_bytes()
+    assert res.xref_get_key(-1, "ID")[1][:34] != src_id[:34]
+    assert "Plain page text" in res[0].get_text()
+    pix = res[0].get_pixmap(clip=pymupdf.Rect(60, 110, 140, 190))
+    assert 190 < sum(pix.samples) / len(pix.samples) < 210  # image intact
+
+
+def test_strip_jpeg_metadata_keeps_decoding_blocks():
+    from redacter.redact import strip_jpeg_metadata
+    jfif = b"\xff\xe0\x00\x07JFIF\x00"
+    icc = b"\xff\xe2\x00\x10ICC_PROFILE\x00\x01\x01"
+    adobe = b"\xff\xee\x00\x04ab"
+    exif = b"\xff\xe1\x00\x08Exif\x00\x00"
+    com = b"\xff\xfe\x00\x05hi!"
+    tail = b"\xff\xdb\x00\x03x\xff\xda\x00\x02SCANDATA\xff\xd9"
+    data = b"\xff\xd8" + jfif + exif + icc + com + adobe + tail
+    assert strip_jpeg_metadata(data) == b"\xff\xd8" + jfif + icc + adobe + tail
+    assert strip_jpeg_metadata(b"not a jpeg") == b"not a jpeg"

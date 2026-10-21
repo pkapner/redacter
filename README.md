@@ -126,8 +126,11 @@ their own if those forms appear.
   (`212-472-5638`, `(212) 472 5638`, `no.2124725638`).
 - **Flattens fillable forms first.** Values typed into fillable form fields
   aren't page text, so they'd be missed without this.
-- **Strips hidden places:** document metadata and XMP, bookmarks,
+- **Strips hidden places:** document info and XMP metadata (on the document
+  and on every page, image and font), EXIF/XMP/comments inside JPEG images,
+  accessibility tags, page labels, named destinations, bookmarks,
   attachments, JavaScript, links, thumbnails, invisible text, and form data.
+  The output gets a fresh file ID, so it can't be matched to the original.
 - **Rewrites the whole file**, with no incremental saves, so old revisions
   of the text don't survive inside it.
 - **Verifies the output.** It re-runs detection on the result, searches the

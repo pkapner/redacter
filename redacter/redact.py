@@ -5,6 +5,7 @@ from __future__ import annotations
 import getpass
 import os
 import re
+import secrets
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -108,10 +109,72 @@ def sanitize(doc: pymupdf.Document) -> None:
     doc.del_xml_metadata()
     doc.set_toc([])  # bookmarks can carry names
     cat = doc.pdf_catalog()
-    for key in ("AcroForm", "Outlines", "PieceInfo", "OpenAction", "AA"):
+    for key in CATALOG_STRIP:
         doc.xref_set_key(cat, key, "null")
-    for page in doc:
-        doc.xref_set_key(page.xref, "PieceInfo", "null")
+    doc.xref_set_key(-1, "Info", "null")
+    for xref in range(1, doc.xref_length()):
+        if not doc.xref_is_stream(xref) and doc.xref_object(xref).lstrip()[:2] != "<<":
+            continue
+        # Per-object metadata: XMP on pages, images, fonts; app private data.
+        for key in OBJECT_STRIP:
+            if doc.xref_get_key(xref, key)[0] != "null":
+                doc.xref_set_key(xref, key, "null")
+        if doc.xref_get_key(xref, "Filter")[1] == "/DCTDecode":
+            raw = doc.xref_stream_raw(xref)
+            clean = strip_jpeg_metadata(raw)
+            if clean != raw:
+                doc.update_stream(xref, clean, compress=False)
+                doc.xref_set_key(xref, "Filter", "/DCTDecode")
+    # A fresh file ID: the original's ID would link this copy to the
+    # unredacted file it came from.
+    doc.xref_set_key(-1, "ID", f"[<{secrets.token_hex(16)}><{secrets.token_hex(16)}>]")
+
+
+# Catalog entries that can hold names or text outside the page content.
+CATALOG_STRIP = (
+    "AcroForm", "Outlines", "PieceInfo", "OpenAction", "AA", "Info", "Metadata",
+    "StructTreeRoot", "MarkInfo", "PageLabels", "Names", "Dests", "Threads",
+    "SpiderInfo", "Collection", "Legal", "Perms", "URI",
+)
+OBJECT_STRIP = ("Metadata", "PieceInfo", "LastModified")
+
+
+def strip_jpeg_metadata(data: bytes) -> bytes:
+    """Drop EXIF/XMP (APP1), comments and other APPn blocks from a JPEG.
+
+    Keeps what decoding needs: JFIF (APP0), the ICC colour profile (APP2
+    "ICC_PROFILE") and Adobe colour info (APP14). Returns data unchanged if
+    it doesn't parse as a JPEG.
+    """
+    if data[:2] != b"\xff\xd8":
+        return data
+    out = bytearray(data[:2])
+    i = 2
+    while i + 4 <= len(data):
+        if data[i] != 0xFF:
+            return data
+        marker = data[i + 1]
+        if marker == 0xFF:  # fill byte
+            i += 1
+            continue
+        if marker == 0xDA:  # start of scan: the image data follows
+            out += data[i:]
+            return bytes(out)
+        length = int.from_bytes(data[i + 2:i + 4], "big")
+        segment = data[i:i + 2 + length]
+        if len(segment) < 2 + length:
+            return data
+        is_app = 0xE0 <= marker <= 0xEF
+        keep = (
+            not is_app and marker != 0xFE
+            or marker == 0xE0
+            or marker == 0xEE
+            or marker == 0xE2 and segment[4:16] == b"ICC_PROFILE\x00"
+        )
+        if keep:
+            out += segment
+        i += 2 + length
+    return data
 
 
 @dataclass
@@ -157,6 +220,15 @@ def save(doc: pymupdf.Document, out: Path) -> None:
     # so the original text does not survive in an older revision of the file.
     tmp = out.with_name(out.name + ".tmp")
     doc.save(tmp, garbage=4, deflate=True, clean=True, incremental=False)
+    # MuPDF writes a "% Written by MuPDF x.y" comment into the header. Blank
+    # it with spaces of the same length, so every byte offset stays valid.
+    with open(tmp, "r+b") as f:
+        head = f.read(256)
+        blanked = re.sub(rb"% Written by MuPDF[^\r\n]*",
+                         lambda m: b"%" + b" " * (len(m.group()) - 1), head)
+        if blanked != head:
+            f.seek(0)
+            f.write(blanked)
     os.replace(tmp, out)
 
 
@@ -209,9 +281,33 @@ def verify(out: Path, cfg: Config, applied: list[Match], skipped: list[Match]) -
                 leaks[f"raw file bytes still contain {m.text!r}"] = None
                 break
 
+    # 4. No metadata stores survive anywhere in the file.
+    for issue in metadata_leftovers(doc):
+        leaks[issue] = None
+
     result.leaks = list(leaks)
     doc.close()
     return result
+
+
+def metadata_leftovers(doc: pymupdf.Document) -> list[str]:
+    """Places outside the page content that still hold identifying data."""
+    issues = []
+    if any(v for k, v in doc.metadata.items() if k not in ("format", "encryption")):
+        issues.append("document info metadata is not empty")
+    cat = doc.pdf_catalog()
+    for key in CATALOG_STRIP:
+        if doc.xref_get_key(cat, key)[0] not in ("null",):
+            issues.append(f"document catalog still has /{key}")
+    for xref in range(1, doc.xref_length()):
+        for key in OBJECT_STRIP:
+            if doc.xref_get_key(xref, key)[0] != "null":
+                issues.append(f"object {xref} still has /{key}")
+        if doc.xref_get_key(xref, "Filter")[1] == "/DCTDecode":
+            raw = doc.xref_stream_raw(xref)
+            if strip_jpeg_metadata(raw) != raw:
+                issues.append(f"image {xref} still has embedded JPEG metadata")
+    return issues
 
 
 def _compact(s: str) -> str:
