@@ -329,7 +329,7 @@ def _rects_for(
         if bottom - top < 0.1 * size:
             # Overlapping rows: removing this text without touching the
             # neighbours is impossible. Remove it anyway; verification and
-            # the preview will show the collateral damage.
+            # the review copy will show the collateral damage.
             top, bottom = mid - 0.05 * size, mid + 0.05 * size
         # Pull the sides in a little too: a band that merely touches the next
         # glyph removes it, and a removed space shifts the rest of the line.
@@ -400,6 +400,6 @@ def page_warnings(doc: pymupdf.Document) -> list[str]:
         else:
             warnings.append(
                 f"page {pno + 1} has {len(images)} image(s); images are not "
-                f"checked for PII, so look at them in the preview"
+                f"checked for PII, so look at them yourself"
             )
     return warnings

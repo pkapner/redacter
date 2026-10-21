@@ -15,33 +15,60 @@ Requires Python 3.11+.
 ```sh
 git clone <this repo> && cd redacter
 python3 -m venv .venv
-.venv/bin/pip install -e .
-# optional: put it on your PATH
-ln -s "$PWD/.venv/bin/redacter" ~/.local/bin/redacter
+.venv/bin/pip install -e '.[gui]'      # drop [gui] for the command line only
 ```
 
-## Workflow
+On a Mac, build a double-clickable app (into `~/Applications`):
+
+```sh
+scripts/make-mac-app.sh
+```
+
+You can then drop PDFs on its Dock icon. Without the bundle, start the app
+with `.venv/bin/redacter-gui`.
+
+## The app
+
+1. **Drop your PDF** on the window. It's scanned right away. To reuse an
+   existing `redact.toml`, drop it on the window too; the app remembers it.
+2. **Review.** Every match is outlined on the page and listed on the left.
+   Red outlines will be redacted, green ones are kept.
+   - **Select:** click a match (or untick it in the list) to keep it.
+     Right-click it in the list to never redact that value.
+   - **Draw box:** drag a rectangle to black out anything the detectors
+     can't see, like a signature image. Right-click a box to remove it.
+   - **Add term:** drag across text, such as a name, to redact it
+     everywhere. It's saved to your settings.
+   - **Settings tab:** edit your terms, exceptions, detectors and custom
+     patterns.
+3. **Save review PDF…** (optional) writes one unredacted copy with every
+   planned redaction outlined, for checking or printing. Delete it after.
+4. **Redact…** writes the redacted PDF, verifies it, and shows the result.
+   Drag the file chip at the bottom straight to Finder, or use Open /
+   Show in Finder.
+
+## Command line
 
 ```sh
 # 1. Create a config and list your names, addresses, employers, dependents
 redacter init                 # writes ./redact.toml (mode 600)
 $EDITOR redact.toml
 
-# 2. Review: list every match with an ID, and render outlined previews
-redacter scan 2025-return.pdf --preview preview/
+# 2. Review: list every match with an ID, and write an outlined review copy
+redacter scan 2025-return.pdf --review review.pdf
 
 # 3. Apply, keeping any matches you don't want removed (IDs from step 2)
-redacter apply 2025-return.pdf -o 2025-return.redacted.pdf --skip 4,17 --preview preview-out/
+redacter apply 2025-return.pdf -o 2025-return.redacted.pdf --skip 4,17
 
-# 4. Look through preview-out/ (or open the PDF), then delete the previews
-rm -r preview/ preview-out/
+# 4. Check the redacted PDF, then delete the review copy
+rm review.pdf
 ```
 
 `./redact.toml` is used automatically if present; otherwise pass `-c FILE`.
 Encrypted PDFs prompt for their password.
 
-`scan --skip 4,17` shows skipped matches in green in the preview, so you can
-check your choice before applying. IDs stay the same as long as the file and
+`scan --skip 4,17` shows skipped matches in green in the review copy, so
+you can check your choice before applying. IDs stay the same as long as the file and
 config don't change.
 
 ### When something is missed
@@ -115,16 +142,17 @@ their own if those forms appear.
 ## Privacy notes
 
 - `redact.toml` contains your PII. It's in `.gitignore`, as are `*.pdf` and
-  preview images.
-- `scan --preview` images show the **unredacted** text. Delete them when done.
+  `*.png` files.
+- Review copies (`scan --review`, or **Save review PDF…** in the app) show
+  the **unredacted** text. Delete them when done.
 - Avoid putting PII on the command line, where it ends up in shell history.
   Use the config file instead.
 
 ## Development
 
 ```sh
-.venv/bin/pip install -e '.[test]'
-.venv/bin/pytest
+.venv/bin/pip install -e '.[gui,test]'
+.venv/bin/pytest          # app tests run headless; they skip without PySide6
 ```
 
 PyMuPDF is pinned below 2.0, because 2.0 shifts the text that follows a

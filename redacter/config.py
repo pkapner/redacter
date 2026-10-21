@@ -162,3 +162,49 @@ def _str_list(data: dict, key: str, path: Path) -> list[str]:
     if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
         raise ConfigError(f"{path}: {key} must be a list of strings")
     return [v for v in value if v.strip()]
+
+
+def _toml_str(s: str) -> str:
+    # A literal string keeps regex backslashes readable; fall back to a basic
+    # string (JSON escapes are valid TOML) when it holds a quote or newline.
+    if "'" not in s and "\n" not in s:
+        return f"'{s}'"
+    import json
+    return json.dumps(s)
+
+
+def dump_config(cfg: Config) -> str:
+    """Serialize cfg as TOML that load_config reads back unchanged."""
+    lines = [
+        "# redacter config. This file lists your PII: keep it private",
+        "# and out of version control.",
+        "",
+        "terms = [",
+        *(f"    {_toml_str(t)}," for t in cfg.terms),
+        "]",
+        "",
+        "allow = [",
+        *(f"    {_toml_str(a)}," for a in cfg.allow),
+        "]",
+        "",
+        "[patterns]",
+        *(f"{name} = {'true' if on else 'false'}" for name, on in cfg.patterns.items()),
+        "",
+        "[custom]",
+        *(f"{name} = {_toml_str(rx)}" for name, rx in cfg.custom.items()),
+    ]
+    for b in cfg.boxes:
+        lines += ["", "[[boxes]]", f"page = {b.page}",
+                  "rect = [" + ", ".join(f"{v:.1f}" for v in b.rect) + "]"]
+    return "\n".join(lines) + "\n"
+
+
+def save_config(cfg: Config, path: Path) -> None:
+    """Write cfg to path with owner-only permissions, atomically."""
+    import os
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(dump_config(cfg))
+    os.replace(tmp, path)

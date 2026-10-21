@@ -128,13 +128,20 @@ def test_manual_box(pdf, tmp_path):
     assert "Do not redact this line" not in all_text(out)
 
 
-def test_scan_changes_nothing_and_previews(pdf, config, tmp_path, capsys):
+def test_scan_changes_nothing_and_writes_review_pdf(pdf, config, tmp_path, capsys):
     before = pdf.read_bytes()
-    prev = tmp_path / "prev"
-    assert main(["scan", str(pdf), "-c", str(config), "--preview", str(prev)]) == 0
+    review = tmp_path / "review.pdf"
+    assert main(["scan", str(pdf), "-c", str(config), "--review", str(review),
+                 "--skip", "1"]) == 0
     assert pdf.read_bytes() == before
     assert SSN in capsys.readouterr().out
-    assert (prev / "page-001.png").exists()
+    doc = pymupdf.open(review)
+    assert doc.page_count == 1
+    assert "REVIEW COPY" in doc[0].get_text()
+    page = doc[0]
+    annots = list(page.annots())
+    assert sum(a.type[1] == "Square" for a in annots) >= 10
+    assert any("#1 keep" in (a.info.get("content") or "") for a in annots)
 
 
 def test_refuses_to_overwrite(pdf, config, tmp_path):
@@ -369,3 +376,20 @@ def test_value_found_once_is_redacted_everywhere(tmp_path):
         assert gone not in text.replace(",", "").replace("1007500", ""), gone
     for kept in ["Preparer phone", "Phone no.", "1,007,500.", "0.1234567890"]:
         assert kept in text, kept
+
+
+def test_config_round_trip(tmp_path):
+    from redacter.config import Box, save_config
+    cfg = Config()
+    cfg.terms = ["Jane Q. Doe", "O'Brien", "Doe, Jane"]
+    cfg.allow = ["800-829-1040"]
+    cfg.patterns["date"] = True
+    cfg.custom = {"apartment": r"(?:#|apt\.?)\s*2F\b", "q": "it's"}
+    cfg.boxes = [Box(2, (10.0, 20.0, 30.5, 40.0))]
+    p = tmp_path / "sub" / "redact.toml"
+    save_config(cfg, p)
+    assert p.stat().st_mode & 0o077 == 0
+    back = load_config(p)
+    assert (back.terms, back.allow, back.patterns, back.custom) == (
+        cfg.terms, cfg.allow, cfg.patterns, cfg.custom)
+    assert back.boxes[0].page == 2 and back.boxes[0].rect == (10.0, 20.0, 30.5, 40.0)

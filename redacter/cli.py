@@ -9,11 +9,11 @@ import sys
 from pathlib import Path
 
 from . import __version__
-from .config import BUILTIN_PATTERNS, ConfigError, load_config
 import pymupdf
 
+from .config import ConfigError, load_config
 from .detect import TEXT_FLAGS, find_matches, mask_text, page_warnings
-from .redact import RedactError, open_pdf, redact_document, render_preview, save, verify
+from .redact import RedactError, open_pdf, redact_file, write_review_pdf
 
 EXAMPLE_CONFIG = Path(__file__).with_name("redact.example.toml")
 
@@ -37,10 +37,10 @@ def main(argv: list[str] | None = None) -> int:
 
     p_scan = sub.add_parser("scan", help="list what would be redacted, change nothing")
     common(p_scan)
-    p_scan.add_argument("--preview", type=Path, metavar="DIR",
-                        help="render pages to PNG with planned redactions outlined")
+    p_scan.add_argument("--review", type=Path, metavar="PDF",
+                        help="write a review copy with planned redactions outlined")
     p_scan.add_argument("--skip", default="", metavar="IDS",
-                        help="match IDs to keep, e.g. 3,7 (shown in green in the preview)")
+                        help="match IDs to keep, e.g. 3,7 (shown in green in the review copy)")
     p_scan.add_argument("--json", action="store_true", help="print matches as JSON")
     p_scan.add_argument("--mask", action="store_true",
                         help="hide digits in the listing (#), for sharing it")
@@ -51,8 +51,6 @@ def main(argv: list[str] | None = None) -> int:
                          help="output PDF (default: INPUT.redacted.pdf)")
     p_apply.add_argument("--skip", default="", metavar="IDS",
                          help="match IDs from 'scan' to leave unredacted, e.g. 3,7")
-    p_apply.add_argument("--preview", type=Path, metavar="DIR",
-                         help="render the redacted pages to PNG for checking")
     p_apply.add_argument("-f", "--force", action="store_true",
                          help="overwrite the output file if it exists")
 
@@ -64,12 +62,21 @@ def main(argv: list[str] | None = None) -> int:
                            help="points below the label to include (default 60)")
     p_inspect.add_argument("--password")
 
+    p_gui = sub.add_parser("gui", help="open the desktop app")
+    p_gui.add_argument("input", nargs="?", type=Path)
+
     args = parser.parse_args(argv)
     try:
         if args.command == "init":
             return cmd_init(args)
         if args.command == "inspect":
             return cmd_inspect(args)
+        if args.command == "gui":
+            try:
+                from .gui import main as gui_main
+            except ImportError:
+                raise ConfigError("the app needs PySide6: pip install -e '.[gui]'")
+            return gui_main(["redacter"] + ([str(args.input)] if args.input else []))
         cfg = load_config(_config_path(args.config))
         skip = _parse_ids(args.skip)
         if args.command == "scan":
@@ -157,12 +164,10 @@ def cmd_scan(args, cfg, skip: set[int]) -> int:
             print(f"\nplus {len(cfg.boxes)} manual box(es) from the config")
         _print_warnings(doc, cfg)
 
-    if args.preview:
-        paths = render_preview(doc, args.preview, matches, skip)
-        print(f"\npreview: {len(paths)} page(s) in {args.preview}/ "
-              f"(red = will be redacted, green = skipped). "
-              f"These images show the UNREDACTED text, so delete them when done.",
-              file=sys.stderr)
+    if args.review:
+        write_review_pdf(args.input, args.review, matches, skip, password=args.password)
+        print(f"\nreview copy: {args.review} (red = will be redacted, green = kept). "
+              f"It shows the UNREDACTED text, so delete it when done.", file=sys.stderr)
     return 0
 
 
@@ -177,31 +182,21 @@ def cmd_apply(args, cfg, skip: set[int]) -> int:
     matches = find_matches(doc, cfg)
     _check_skip(skip, matches)
     _print_warnings(doc, cfg)
-
-    applied = redact_document(doc, matches, cfg, skip)
-    skipped = [m for m in matches if m.id in skip]
-    save(doc, out)
     doc.close()
 
-    result = verify(out, cfg, applied, skipped)
-    if not result.ok:
-        out.unlink()
+    result = redact_file(args.input, out, cfg, matches, skip, password=args.password)
+    if not result.verification.ok:
         print("error: verification FAILED, output deleted:", file=sys.stderr)
-        for leak in result.leaks:
+        for leak in result.verification.leaks:
             print(f"  {leak}", file=sys.stderr)
         return 2
 
-    print(f"redacted {len(applied)} match(es)"
-          + (f" and {len(cfg.boxes)} manual box(es)" if cfg.boxes else "")
-          + (f", kept {len(skipped)}" if skipped else "")
+    print(f"redacted {len(result.applied)} match(es)"
+          + (f" and {result.boxes} manual box(es)" if result.boxes else "")
+          + (f", kept {len(result.skipped)}" if result.skipped else "")
           + f" -> {out}")
     print("verified: no detected PII remains in the text, and no redacted string "
           "remains in the file")
-
-    if args.preview:
-        out_doc = open_pdf(out)
-        paths = render_preview(out_doc, args.preview)
-        print(f"preview: {len(paths)} page(s) in {args.preview}/")
     return 0
 
 

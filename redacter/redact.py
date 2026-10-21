@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pymupdf
 
-from .config import Config
+from .config import Box, Config
 from .detect import Match, find_matches, page_text, value_regex
 
 FILL = (0, 0, 0)
@@ -20,7 +20,12 @@ class RedactError(Exception):
     pass
 
 
-def open_pdf(path: Path, password: str | None = None) -> pymupdf.Document:
+class PasswordNeeded(RedactError):
+    """The PDF is encrypted and no password (or a wrong one) was given."""
+
+
+def open_pdf(path: Path, password: str | None = None,
+             prompt: bool = True) -> pymupdf.Document:
     try:
         doc = pymupdf.open(path)
     except Exception as e:
@@ -29,9 +34,11 @@ def open_pdf(path: Path, password: str | None = None) -> pymupdf.Document:
         raise RedactError(f"{path} is not a PDF")
     if doc.needs_pass:
         if password is None:
+            if not prompt:
+                raise PasswordNeeded(f"{path.name} is password protected")
             password = getpass.getpass(f"Password for {path.name}: ")
         if not doc.authenticate(password):
-            raise RedactError(f"wrong password for {path}")
+            raise PasswordNeeded(f"wrong password for {path.name}")
     # Flatten form fields and annotations into page content. Filled-in values
     # of fillable forms live in widgets, not page text: without this they are
     # invisible to detection and would survive redaction.
@@ -44,10 +51,12 @@ def redact_document(
     matches: list[Match],
     cfg: Config,
     skip: set[int],
+    boxes: list[Box] = (),
 ) -> list[Match]:
     """Black out matches (minus skipped IDs) and manual boxes, then sanitize.
 
-    Returns the matches that were redacted.
+    Manual boxes are the config's plus any given in boxes. Returns the
+    matches that were redacted.
     """
     applied = [m for m in matches if m.id not in skip]
     covers: dict[int, list[pymupdf.Rect]] = {}
@@ -57,7 +66,7 @@ def redact_document(
             page.add_redact_annot(r, fill=FILL, cross_out=False)
         covers.setdefault(m.page, []).extend(m.rects)
 
-    for box in cfg.boxes:
+    for box in [*cfg.boxes, *boxes]:
         if box.page > doc.page_count:
             raise RedactError(
                 f"box on page {box.page}, but the PDF has {doc.page_count} pages"
@@ -103,6 +112,44 @@ def sanitize(doc: pymupdf.Document) -> None:
         doc.xref_set_key(cat, key, "null")
     for page in doc:
         doc.xref_set_key(page.xref, "PieceInfo", "null")
+
+
+@dataclass
+class RedactResult:
+    applied: list[Match]
+    skipped: list[Match]
+    boxes: int
+    verification: "Verification"
+
+
+def redact_file(
+    src: Path,
+    out: Path,
+    cfg: Config,
+    matches: list[Match] | None = None,
+    skip: set[int] = frozenset(),
+    boxes: list[Box] = (),
+    password: str | None = None,
+) -> RedactResult:
+    """Write a redacted, verified copy of src to out.
+
+    matches defaults to a fresh scan; pass the list a caller already showed
+    the user so its choices (skip IDs) apply. If verification fails, out is
+    deleted and the result lists the leaks.
+    """
+    if out.resolve() == src.resolve():
+        raise RedactError("output must differ from input")
+    doc = open_pdf(src, password, prompt=False)
+    if matches is None:
+        matches = find_matches(doc, cfg)
+    applied = redact_document(doc, matches, cfg, skip, boxes)
+    skipped = [m for m in matches if m.id in skip]
+    save(doc, out)
+    doc.close()
+    result = verify(out, cfg, applied, skipped)
+    if not result.ok:
+        out.unlink()
+    return RedactResult(applied, skipped, len(cfg.boxes) + len(boxes), result)
 
 
 def save(doc: pymupdf.Document, out: Path) -> None:
@@ -181,46 +228,58 @@ def _raw_needles(text: str) -> list[bytes]:
     return [n for n in needles if len(n) >= 4]
 
 
-def render_preview(
-    doc: pymupdf.Document,
-    out_dir: Path,
-    matches: list[Match] | None = None,
-    skip: set[int] = frozenset(),
-    zoom: float = 2.0,
-) -> list[Path]:
-    """Render each page to PNG. With matches, outline them (red) with IDs.
+REVIEW_RED = (0.85, 0, 0)
+REVIEW_GREEN = (0, 0.55, 0)
+REVIEW_BLUE = (0.1, 0.3, 0.9)
 
-    Skipped matches are outlined in green so they are easy to tell apart.
+
+def write_review_pdf(
+    src: Path,
+    out: Path,
+    matches: list[Match],
+    skip: set[int] = frozenset(),
+    boxes: list[Box] = (),
+    password: str | None = None,
+) -> None:
+    """Write an UNREDACTED copy of src with every planned redaction outlined.
+
+    Red outlines will be redacted, green ones are kept, blue are manual
+    boxes; each match is labelled with its ID. Every page is stamped as a
+    review copy, since it still contains all the PII.
     """
-    out_dir.mkdir(parents=True, exist_ok=True)
-    os.chmod(out_dir, 0o700)
-    paths = []
-    mat = pymupdf.Matrix(zoom, zoom)
+    doc = open_pdf(src, password, prompt=False)
     by_page: dict[int, list[Match]] = {}
-    for m in matches or []:
+    for m in matches:
         by_page.setdefault(m.page, []).append(m)
+    box_pages: dict[int, list[Box]] = {}
+    for b in boxes:
+        box_pages.setdefault(b.page - 1, []).append(b)
 
     for pno, page in enumerate(doc):
-        shapes = []
         for m in by_page.get(pno, []):
-            color = (0, 0.6, 0) if m.id in skip else (1, 0, 0)
+            color = REVIEW_GREEN if m.id in skip else REVIEW_RED
             for r in m.rects:
-                annot = page.add_rect_annot(r)
+                annot = page.add_rect_annot(r + (-1, -1, 1, 1))
                 annot.set_colors(stroke=color)
                 annot.set_border(width=1)
                 annot.update()
-                shapes.append(annot)
             label = m.rects[0]
             annot = page.add_freetext_annot(
-                pymupdf.Rect(label.x0, label.y0 - 9, label.x0 + 30, label.y0),
-                f"#{m.id}", fontsize=7, text_color=color, fill_color=None,
+                pymupdf.Rect(label.x0, label.y0 - 8, label.x0 + 40, label.y0),
+                f"#{m.id}" + (" keep" if m.id in skip else ""),
+                fontsize=6, text_color=color, fill_color=None, border_width=0,
             )
-            shapes.append(annot)
-        pix = page.get_pixmap(matrix=mat, annots=True)
-        path = out_dir / f"page-{pno + 1:03d}.png"
-        pix.save(path)
-        os.chmod(path, 0o600)
-        paths.append(path)
-        for annot in shapes:
-            page.delete_annot(annot)
-    return paths
+        for b in box_pages.get(pno, []):
+            annot = page.add_rect_annot(pymupdf.Rect(b.rect))
+            annot.set_colors(stroke=REVIEW_BLUE)
+            annot.set_border(width=1.5, dashes=[3, 2])
+            annot.update()
+        page.insert_text(
+            (page.rect.x0 + 10, page.rect.y0 + 10),
+            "REVIEW COPY - NOT REDACTED - contains personal information",
+            fontsize=7, color=REVIEW_RED,
+        )
+    doc.set_metadata({"title": "REVIEW COPY - NOT REDACTED"})
+    doc.save(out, garbage=3, deflate=True)
+    os.chmod(out, 0o600)
+    doc.close()
