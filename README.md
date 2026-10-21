@@ -44,6 +44,21 @@ Encrypted PDFs prompt for their password.
 check your choice before applying. IDs stay the same as long as the file and
 config don't change.
 
+### When something is missed
+
+If you can see PII on the page that `scan` doesn't list, check how the tool
+reads that spot:
+
+```sh
+redacter inspect 2025-return.pdf "social security"
+```
+
+This prints the row with that label plus the rows after it. Digits are
+masked as `#`, so you can share the output without revealing the number.
+A `·` marks a small gap the tool read as a space, and a `⇥` marks a wide
+gap. If the label isn't found at all, that part of the page is an image
+or drawn shapes, so use a `[[boxes]]` entry for it.
+
 ## What gets redacted
 
 | Detector         | Example                     | Default |
@@ -55,6 +70,7 @@ config don't change.
 | `account_number` | 10–17 digit runs            | on      |
 | `phone`          | `(555) 867-5309`            | on      |
 | `email`          | `jane@example.com`          | on      |
+| `spaced_digits`  | `1 2 3 \| 4 5 \| 6 7 8 9` (SSN/EIN in per-digit form boxes) | on |
 | `date`           | `01/02/1980`                | off     |
 
 You can also add your own regexes under `[custom]`, exceptions under `allow`,

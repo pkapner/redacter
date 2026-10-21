@@ -6,6 +6,7 @@ import re
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 # Built-in patterns. Digit groups use lookarounds rather than \b so that a
 # match never starts or ends in the middle of a longer number.
@@ -20,6 +21,10 @@ BUILTIN_PATTERNS: dict[str, str] = {
     "account_number": r"(?<![\d,.$])\d{10,17}(?![\d,]|\.\d)",
     "phone": r"(?<![\d\w])(?:\+?1[ .-]?)?(?:\(\d{3}\)|\d{3})[ .-]?\d{3}[ .-]\d{4}(?!\d)",
     "email": r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
+    # Digits spread across separate boxes, as in a form's SSN/EIN cells:
+    # "1 2 0 0 2 5 0 0 0". Matches whole runs of digits joined only by
+    # spaces, tabs, or dashes; _spaced_id keeps the runs of exactly 9.
+    "spaced_digits": r"\d(?:[ \t-]*\d)*",
     # Dates: off by default, because tax forms are full of non-sensitive dates
     "date": r"(?<!\d)(?:0?[1-9]|1[0-2])[/-](?:0?[1-9]|[12]\d|3[01])[/-](?:19|20)\d{2}(?!\d)",
 }
@@ -31,8 +36,24 @@ DEFAULT_ENABLED = {
     "account_number": True,
     "phone": True,
     "email": True,
+    "spaced_digits": True,
     "date": False,
 }
+
+
+def _spaced_id(m: re.Match) -> bool:
+    if sum(c.isdigit() for c in m.group()) != 9:
+        return False
+    s, start, end = m.string, m.start(), m.end()
+    if start and s[start - 1] in ",.$":  # tail of an amount like 1,234 567 890
+        return False
+    if end < len(s) and s[end] in ",." and s[end + 1:end + 2].isdigit():
+        return False
+    return True
+
+
+# Extra checks a built-in pattern's matches must pass.
+BUILTIN_FILTERS = {"spaced_digits": _spaced_id}
 
 
 class ConfigError(Exception):
@@ -53,16 +74,17 @@ class Config:
     custom: dict[str, str] = field(default_factory=dict)
     boxes: list[Box] = field(default_factory=list)
 
-    def compiled_patterns(self) -> list[tuple[str, re.Pattern]]:
-        """Return (kind, regex) pairs in matching order: terms, custom, built-ins."""
+    def compiled_patterns(self) -> list[tuple[str, re.Pattern, Callable | None]]:
+        """Return (kind, regex, filter) in matching order: terms, custom, built-ins."""
         out = []
         for term in self.terms:
-            out.append(("term", term_regex(term)))
+            out.append(("term", term_regex(term), None))
         for name, rx in self.custom.items():
-            out.append((name, re.compile(rx, re.IGNORECASE)))
+            out.append((name, re.compile(rx, re.IGNORECASE), None))
         for name, enabled in self.patterns.items():
             if enabled:
-                out.append((name, re.compile(BUILTIN_PATTERNS[name])))
+                out.append((name, re.compile(BUILTIN_PATTERNS[name]),
+                            BUILTIN_FILTERS.get(name)))
         return out
 
 

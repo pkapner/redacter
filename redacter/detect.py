@@ -132,9 +132,9 @@ def find_matches(doc: pymupdf.Document, cfg: Config) -> list[Match]:
     for pno, page in enumerate(doc):
         pt = page_text(page)
         spans = []  # (start, end, kind)
-        for kind, rx in patterns:
+        for kind, rx, keep in patterns:
             for m in rx.finditer(pt.text):
-                if m.end() > m.start():
+                if m.end() > m.start() and (keep is None or keep(m)):
                     spans.append((m.start(), m.end(), kind))
 
         # Earliest start first, longest first; drop spans inside a kept span.

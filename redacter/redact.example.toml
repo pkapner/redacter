@@ -25,6 +25,7 @@ nine_digit = true      # bare 9 digits: undashed SSN/EIN, routing numbers
 account_number = true  # 10-17 digit runs: bank accounts
 phone = true
 email = true
+spaced_digits = true   # 9 digits in separate boxes: 1 2 0 | 0 2 | 5 0 0 0
 date = false           # 01/02/1980 -- off: tax forms are full of dates
 
 # Your own regexes (Python syntax, case-insensitive), as name = "regex".

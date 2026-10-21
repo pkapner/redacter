@@ -172,6 +172,34 @@ def test_ssn_does_not_match_inside_longer_numbers():
     assert [m for m in find_matches(doc, cfg) if m.kind == "ssn"] == []
 
 
+@pytest.mark.parametrize("cell,group_gap", [(14, 12), (18, 10), (22, 20), (16, 40)])
+def test_ssn_in_per_digit_boxes(tmp_path, cell, group_gap):
+    # Form SSN fields often put each digit in its own cell, three groups
+    # separated by dividers; spacing varies from form to form.
+    src = tmp_path / "in.pdf"
+    doc = pymupdf.open()
+    page = doc.new_page()
+    page.insert_text((300, 160), "Your social security number", fontsize=7)
+    x = 300
+    for group in ["120", "02", "5000"]:
+        for d in group:
+            page.insert_text((x, 170), d, fontsize=8)
+            x += cell
+        x += group_gap
+    page.insert_text((300, 200), "Amounts 1,234 567 890 and 1 2 3 4 5 6 7 8 9 0", fontsize=8)
+    doc.save(src)
+
+    found = [m for m in find_matches(open_pdf(src), Config())]
+    assert len(found) == 1 and found[0].kind in ("ssn", "spaced_digits")
+    assert found[0].text.replace(" ", "").replace("\t", "") == "120025000"
+
+    out = tmp_path / "out.pdf"
+    assert main(["apply", str(src), "-o", str(out)]) == 0
+    text = all_text(out)
+    assert not any(d in text.split("number")[1].split("Amounts")[0] for d in "0125")
+    assert "1,234 567 890" in text
+
+
 def test_init_writes_private_config(tmp_path):
     p = tmp_path / "redact.toml"
     assert main(["init", str(p)]) == 0
@@ -198,3 +226,10 @@ def test_text_after_redaction_does_not_move(tmp_path):
     assert SSN not in after
     for w in ["Line", "above", "gjpqy", "4,500.", "below", "TTTT", "7,200.", "Wages"]:
         assert after.get(w) == before[w], w
+
+
+def test_inspect_masks_digits(pdf, capsys):
+    assert main(["inspect", str(pdf), "first name", "--rows", "1"]) == 0
+    out = capsys.readouterr().out
+    assert "JANE" in out and "###-##-####" in out
+    assert not any(c.isdigit() for line in out.splitlines()[1:] for c in line.split(":", 1)[1])

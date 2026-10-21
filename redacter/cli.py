@@ -10,7 +10,7 @@ from pathlib import Path
 
 from . import __version__
 from .config import BUILTIN_PATTERNS, ConfigError, load_config
-from .detect import find_matches, page_warnings
+from .detect import find_matches, page_text, page_warnings
 from .redact import RedactError, open_pdf, redact_document, render_preview, save, verify
 
 EXAMPLE_CONFIG = Path(__file__).with_name("redact.example.toml")
@@ -52,10 +52,19 @@ def main(argv: list[str] | None = None) -> int:
     p_apply.add_argument("-f", "--force", action="store_true",
                          help="overwrite the output file if it exists")
 
+    p_inspect = sub.add_parser(
+        "inspect", help="show how the text near a label is read, digits masked")
+    p_inspect.add_argument("input", type=Path)
+    p_inspect.add_argument("label", help='text to look for, e.g. "social security"')
+    p_inspect.add_argument("--rows", type=int, default=3, help="rows to show after the label")
+    p_inspect.add_argument("--password")
+
     args = parser.parse_args(argv)
     try:
         if args.command == "init":
             return cmd_init(args)
+        if args.command == "inspect":
+            return cmd_inspect(args)
         cfg = load_config(_config_path(args.config))
         skip = _parse_ids(args.skip)
         if args.command == "scan":
@@ -75,6 +84,50 @@ def cmd_init(args) -> int:
         f.write(EXAMPLE_CONFIG.read_text())
     print(f"wrote {args.path} (mode 600). Add your names and addresses to 'terms'.")
     print("Keep this file out of version control: it lists your PII.")
+    return 0
+
+
+def cmd_inspect(args) -> int:
+    """Print the rows around a label as the detector sees them.
+
+    Digits are replaced with '#', so the output can be shared to debug a
+    missed match without revealing the number itself. Gaps the tool filled
+    in are shown as a middle dot (space) or an arrow (wide gap / tab).
+    """
+    doc = open_pdf(args.input, args.password)
+    needle = " ".join(args.label.split()).casefold()
+    found = False
+    for pno, page in enumerate(doc):
+        pt = page_text(page)
+        rows: dict[int, list] = {}
+        for ch in pt.chars:
+            if ch.c != "\n":
+                rows.setdefault(ch.row, []).append(ch)
+        for r, chars in rows.items():
+            line = " ".join("".join(c.c for c in chars).split()).casefold()
+            if needle not in line:
+                continue
+            found = True
+            print(f"page {pno + 1}:")
+            for rr in range(r, r + args.rows + 1):
+                if rr not in rows:
+                    continue
+                cs = rows[rr]
+                shown = "".join(
+                    "#" if c.c.isdigit()
+                    else ("\u00b7" if c.c == " " else "\u21e5") if c.bbox is None
+                    else c.c
+                    for c in cs
+                )
+                boxes = [c.bbox for c in cs if c.bbox is not None]
+                sizes = sorted({round(c.size, 1) for c in cs if c.bbox is not None})
+                x0 = min(b.x0 for b in boxes) if boxes else 0
+                y = cs[0].baseline
+                where = f"x={x0:.0f} y={y:.0f}" if y is not None else "rotated"
+                print(f"  row {rr - r:+d} ({where}, size {sizes}): {shown}")
+    if not found:
+        print(f"{args.label!r} not found in the PDF's text. If you can see it on the "
+              f"page, that part is an image or drawn shapes, not text.")
     return 0
 
 
