@@ -239,3 +239,45 @@ def test_inspect_masks_digits(pdf, capsys):
 def test_mask_text_hides_unreadable_chars():
     from redacter.detect import mask_text
     assert mask_text("A1\x13\ue001\ufffd\u00e9") == "A#\u25a1\u25c7\ufffd\u00a4"
+
+
+def make_zero_width_font_pdf(path: Path) -> Path:
+    """Glyphs from a font whose widths are all 0, each placed by a TJ offset,
+    as CCH tax software does. MuPDF reports zero-width character boxes."""
+    doc = pymupdf.open()
+    page = doc.new_page()
+    font = doc.get_new_xref()
+    doc.update_object(font, "<</Type/Font/Subtype/Type1/BaseFont/Courier/FirstChar 32"
+                      "/LastChar 126/Widths[" + " ".join(["0"] * 95) + "]>>")
+    res = doc.get_new_xref()
+    doc.update_object(res, f"<</Font<</ZW {font} 0 R>>>>")
+    doc.xref_set_key(page.xref, "Resources", f"{res} 0 R")
+
+    def show(x, y, s):
+        glyphs = " ".join(f"({c}) -600" for c in s)
+        return f"BT /ZW 10 Tf {x} {y} Td [{glyphs}] TJ ET "
+
+    body = (show(50, 720, "031176110") + show(130, 720, "36057570935")
+            + show(50, 690, "123 45 6789") + show(50, 670, "LILY KAPNER")
+            + show(50, 650, "Keep this"))
+    contents = doc.get_new_xref()
+    doc.update_object(contents, "<<>>")
+    doc.update_stream(contents, body.encode())
+    doc.xref_set_key(page.xref, "Contents", f"{contents} 0 R")
+    doc.save(path)
+    return path
+
+
+def test_zero_width_font_glyphs(tmp_path):
+    src = make_zero_width_font_pdf(tmp_path / "in.pdf")
+    cfg = tmp_path / "c.toml"
+    cfg.write_text('terms = ["Lily Kapner"]\n')
+    kinds = {m.kind for m in find_matches(open_pdf(src), load_config(cfg))}
+    assert kinds == {"nine_digit", "account_number", "ssn", "term"}
+
+    out = tmp_path / "out.pdf"
+    assert main(["apply", str(src), "-c", str(cfg), "-o", str(out)]) == 0
+    text = "".join(all_text(out).split())  # default extraction spaces every glyph
+    assert "Keepthis" in text
+    for secret in ["031176110", "36057570935", "6789", "KAPNER"]:
+        assert secret not in text

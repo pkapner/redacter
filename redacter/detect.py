@@ -95,6 +95,12 @@ def page_text(page: pymupdf.Page) -> PageText:
             row_y = y
     for row in rows:
         row.sort(key=lambda c: c[3][0])
+        _fix_degenerate_boxes(row)
+    for line in other_lines:
+        for i, (c, b, s, o) in enumerate(line):
+            if b.is_empty:  # rotated: no baseline to rebuild from; pad it
+                line[i] = (c, pymupdf.Rect(b.x0 - 0.3 * s, b.y0 - 0.3 * s,
+                                           b.x1 + 0.3 * s, b.y1 + 0.3 * s), s, o)
     rows.extend(other_lines)
 
     out: list[Char] = []
@@ -119,6 +125,28 @@ def page_text(page: pymupdf.Page) -> PageText:
             prev = (c, bbox)
 
     return PageText("".join(ch.c for ch in out), out)
+
+
+def _fix_degenerate_boxes(row: list) -> None:
+    """Rebuild zero-width or zero-height character boxes in a sorted row.
+
+    Some tax software (CCH, for one) embeds fonts with zero glyph widths and
+    positions every glyph explicitly, so MuPDF reports boxes with x0 == x1.
+    Such boxes break gap detection and give nothing to redact. The width is
+    taken from the distance to the next character, the height from the
+    font size.
+    """
+    for i, (c, b, size, origin) in enumerate(row):
+        x0, y0, x1, y1 = b
+        if b.width < 0.01 * size:
+            nxt = row[i + 1][3][0] if i + 1 < len(row) else None
+            step = nxt - origin[0] if nxt is not None else 0
+            x0 = origin[0]
+            x1 = x0 + (step if 0 < step <= 1.2 * size else 0.6 * size)
+        if b.height < 0.01 * size:
+            y0, y1 = origin[1] - 0.8 * size, origin[1] + 0.2 * size
+        if (x0, y0, x1, y1) != tuple(b):
+            row[i] = (c, pymupdf.Rect(x0, y0, x1, y1), size, origin)
 
 
 def _norm(s: str) -> str:
@@ -152,7 +180,10 @@ def find_matches(doc: pymupdf.Document, cfg: Config) -> list[Match]:
                 continue
             rects, cut_rects = _rects_for(pt.chars[start:end], pt.chars)
             if not rects:
-                continue
+                # Never drop a match silently: it would be neither shown nor
+                # redacted. Degenerate boxes are rebuilt upstream, so this is a bug.
+                raise RuntimeError(
+                    f"page {pno + 1}: match {kind!r} has no location on the page")
             ctx = pt.text[max(0, start - 30):end + 30]
             ctx = re.sub(r"\s+", " ", ctx).strip()
             matches.append(Match(0, pno, kind, text, ctx, rects, cut_rects))
