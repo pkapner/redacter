@@ -109,6 +109,13 @@ def page_text(page: pymupdf.Page) -> PageText:
             out.append(Char("\n", None, r))
         prev = None
         dividers = _dividers(row) if row and row[0][3] is not None else set()
+        gaps = [0.0] + [row[i][1].x0 - row[i - 1][1].x1 for i in range(1, len(row))]
+
+        def digit_gap(i):  # gap before row[i] if it sits between two digits
+            if 0 < i < len(row) and row[i - 1][0].isdigit() and row[i][0].isdigit():
+                return gaps[i]
+            return None
+
         for i, (c, bbox, size, origin) in enumerate(row):
             if i in dividers:
                 # Read a box divider as a space; leave its outline out of
@@ -123,9 +130,21 @@ def page_text(page: pymupdf.Page) -> PageText:
                     # Far apart: different form columns. A tab keeps number
                     # patterns (which only allow spaces) from joining them.
                     out.append(Char("\t", None, r))
-                elif gap > 0.25 * size and not (both_digits and gap < 1.5 * size):
-                    # Visible gap with no space character. Digits in comb
-                    # fields (one box per digit) are left joined.
+                elif both_digits:
+                    # Digits in comb fields (one box per digit) are evenly
+                    # spaced and stay joined. A gap clearly wider than the
+                    # spacing of the digits around it separates two numbers,
+                    # e.g. a routing number printed right before an account
+                    # number, or the groups of an SSN.
+                    around = [g for g in (digit_gap(i - 1), digit_gap(i + 1)) if g is not None]
+                    if around:
+                        split = gap > 1.5 * max(0.0, *around) + 0.15 * size
+                    else:
+                        split = gap >= 1.5 * size
+                    if split:
+                        out.append(Char(" ", None, r))
+                elif gap > 0.25 * size:
+                    # Visible gap with no space character.
                     out.append(Char(" ", None, r))
             baseline = origin[1] if origin is not None else None
             out.append(Char(c.translate(_NORMALIZE), bbox, r, baseline, size))
@@ -161,8 +180,10 @@ def _fix_degenerate_boxes(row: list) -> None:
     Some tax software (CCH, for one) embeds fonts with zero glyph widths and
     positions every glyph explicitly, so MuPDF reports boxes with x0 == x1.
     Such boxes break gap detection and give nothing to redact. The width is
-    taken from the distance to the next character, the height from the
-    font size.
+    the distance to the next character, capped at a typical glyph width
+    (0.6 em, exact for the Courier-style fonts used for filled-in values) so
+    that real spacing between two numbers still shows as a gap. The height
+    comes from the font size.
     """
     for i, (c, b, size, origin) in enumerate(row):
         x0, y0, x1, y1 = b
@@ -170,7 +191,7 @@ def _fix_degenerate_boxes(row: list) -> None:
             nxt = row[i + 1][3][0] if i + 1 < len(row) else None
             step = nxt - origin[0] if nxt is not None else 0
             x0 = origin[0]
-            x1 = x0 + (step if 0 < step <= 1.2 * size else 0.6 * size)
+            x1 = x0 + (min(step, 0.6 * size) if step > 0 else 0.6 * size)
         if b.height < 0.01 * size:
             y0, y1 = origin[1] - 0.8 * size, origin[1] + 0.2 * size
         if (x0, y0, x1, y1) != tuple(b):

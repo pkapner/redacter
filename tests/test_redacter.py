@@ -317,3 +317,33 @@ def test_ssn_with_divider_glyphs_between_boxes(tmp_path, divider_dy):
     text = "".join(all_text(out).split())
     assert "Yoursocialsecuritynumber" in text
     assert not any(d in text for d in "12346789")
+
+
+def test_adjacent_routing_and_account_numbers(tmp_path):
+    # CCH's direct-deposit table: zero-width font, digits 6.9pt apart, the
+    # account number starting 2.4 digit-widths after the routing number.
+    doc = pymupdf.open()
+    page = doc.new_page()
+    zw = doc.get_new_xref()
+    doc.update_object(zw, "<</Type/Font/Subtype/Type1/BaseFont/Courier/FirstChar 32"
+                      "/LastChar 126/Widths[" + " ".join(["0"] * 95) + "]>>")
+    res = doc.get_new_xref()
+    doc.update_object(res, f"<</Font<</ZW {zw} 0 R>>>>")
+    doc.xref_set_key(page.xref, "Resources", f"{res} 0 R")
+    step = -round(6.9 / 9.8 * 1000)
+
+    def show(x, y, s):
+        return f"BT /ZW 9.8 Tf {x} {y} Td [" + " ".join(f"({c}) {step}" for c in s) + "] TJ ET "
+
+    body = ""
+    for y in (700, 676, 652):
+        body += show(400, y, "021000021") + show(472, y, "12345678901")
+    contents = doc.get_new_xref()
+    doc.update_object(contents, "<<>>")
+    doc.update_stream(contents, body.encode())
+    doc.xref_set_key(page.xref, "Contents", f"{contents} 0 R")
+    src = tmp_path / "in.pdf"
+    doc.save(src)
+
+    found = sorted((m.kind, m.text) for m in find_matches(open_pdf(src), Config()))
+    assert found == [("account_number", "12345678901")] * 3 + [("nine_digit", "021000021")] * 3
