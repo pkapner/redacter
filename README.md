@@ -86,6 +86,9 @@ their own if those forms appear.
 
 ## What else it does
 
+- **Redacts every copy.** A number found anywhere, such as a phone number,
+  is also removed everywhere else it appears, whatever its formatting
+  (`212-472-5638`, `(212) 472 5638`, `no.2124725638`).
 - **Flattens fillable forms first.** Values typed into fillable form fields
   aren't page text, so they'd be missed without this.
 - **Strips hidden places:** document metadata and XMP, bookmarks,

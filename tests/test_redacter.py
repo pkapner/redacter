@@ -347,3 +347,25 @@ def test_adjacent_routing_and_account_numbers(tmp_path):
 
     found = sorted((m.kind, m.text) for m in find_matches(open_pdf(src), Config()))
     assert found == [("account_number", "12345678901")] * 3 + [("nine_digit", "021000021")] * 3
+
+
+def test_value_found_once_is_redacted_everywhere(tmp_path):
+    src = tmp_path / "in.pdf"
+    doc = pymupdf.open()
+    page = doc.new_page()
+    page.insert_text((50, 100), "Preparer phone 212-472-5638", fontsize=10)
+    page.insert_text((50, 130), "Designee Phone no.2124725638 PIN 4", fontsize=10)
+    page.insert_text((50, 160), "Office (212) 472 5638", fontsize=10)
+    page.insert_text((50, 190), "New York, NY 10075  Total 1,007,500. Rate 0.1234567890", fontsize=10)
+    page.insert_text((50, 220), "Second page header NY10075", fontsize=10)
+    doc.save(src)
+    cfg = tmp_path / "c.toml"
+    cfg.write_text("[custom]\nzip = '(?<!\\d)10075(?:-?\\d{4})?(?!\\d)'\n")
+
+    out = tmp_path / "out.pdf"
+    assert main(["apply", str(src), "-c", str(cfg), "-o", str(out)]) == 0
+    text = all_text(out)
+    for gone in ["5638", "2124725638", "10075"]:
+        assert gone not in text.replace(",", "").replace("1007500", ""), gone
+    for kept in ["Preparer phone", "Phone no.", "1,007,500.", "0.1234567890"]:
+        assert kept in text, kept

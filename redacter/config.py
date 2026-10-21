@@ -16,9 +16,9 @@ BUILTIN_PATTERNS: dict[str, str] = {
     # Employer ID number: 12-3456789
     "ein": r"(?<!\d)\d{2}[ ]*-[ ]*\d{7}(?!\d)",
     # Bare 9-digit run: an undashed SSN/EIN/ITIN or a bank routing number
-    "nine_digit": r"(?<![\d,.$])\d{9}(?![\d,]|\.\d)",
+    "nine_digit": r"(?<![\d,$])(?<!\d\.)\d{9}(?![\d,]|\.\d)",
     # Bank account and similar long numbers
-    "account_number": r"(?<![\d,.$])\d{10,17}(?![\d,]|\.\d)",
+    "account_number": r"(?<![\d,$])(?<!\d\.)\d{10,17}(?![\d,]|\.\d)",
     "phone": r"(?<![\d\w])(?:\+?1[ .-]?)?(?:\(\d{3}\)|\d{3})[ .-]?\d{3}[ .-]\d{4}(?!\d)",
     "email": r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
     # Digits spread across separate boxes, as in a form's SSN/EIN cells:

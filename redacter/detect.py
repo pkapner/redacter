@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 
 import pymupdf
 
-from .config import Config
+from .config import Config, term_regex
 
 # No clipping to the visible page: text hidden outside the crop box still
 # leaks through copy/paste and text extraction, so it must be found too.
@@ -202,18 +202,58 @@ def _norm(s: str) -> str:
     return " ".join(s.split()).casefold()
 
 
+def value_regex(text: str) -> re.Pattern | None:
+    """Regex for other copies of an already-found value, in any formatting.
+
+    A number matches with any spaces, dashes or parentheses between its
+    digits (212-472-5638 also finds 2124725638 and (212) 472 5638), but not
+    inside a longer number or an amount. Other values match as terms do.
+    """
+    if re.fullmatch(r"[\d\s\-()]+", text):
+        digits = re.sub(r"\D", "", text)
+        if len(digits) < 5:
+            return None
+        body = r"[ \-()]*".join(digits)
+        return re.compile(rf"(?<![\d,$])(?<!\d\.){body}(?![\d,]|\.\d)")
+    if not text.split():
+        return None
+    return term_regex(text)
+
+
 def find_matches(doc: pymupdf.Document, cfg: Config) -> list[Match]:
     patterns = cfg.compiled_patterns()
     allowed = {_norm(a) for a in cfg.allow}
-    matches: list[Match] = []
+    texts = [page_text(page) for page in doc]
 
-    for pno, page in enumerate(doc):
-        pt = page_text(page)
+    # First pass: every pattern on every page.
+    found: list[list[tuple[int, int, str]]] = []
+    for pt in texts:
         spans = []  # (start, end, kind)
         for kind, rx, keep in patterns:
             for m in rx.finditer(pt.text):
                 if m.end() > m.start() and (keep is None or keep(m)):
                     spans.append((m.start(), m.end(), kind))
+        found.append(spans)
+
+    # Second pass: a value found anywhere is redacted everywhere, however it
+    # is formatted there (a phone number found as 212-472-5638 on one line
+    # is also removed where it appears as "no.2124725638").
+    repeats: dict[str, tuple[re.Pattern, str]] = {}
+    for pt, spans in zip(texts, found):
+        for start, end, kind in spans:
+            value = pt.text[start:end]
+            if kind == "term" or _norm(value) in allowed:
+                continue  # terms already match every occurrence
+            key = re.sub(r"\D", "", value) or _norm(value)
+            if key not in repeats and (rx := value_regex(value)):
+                repeats[key] = (rx, kind)
+    for pt, spans in zip(texts, found):
+        for rx, kind in repeats.values():
+            for m in rx.finditer(pt.text):
+                spans.append((m.start(), m.end(), f"{kind} (repeat)"))
+
+    matches: list[Match] = []
+    for pno, (pt, spans) in enumerate(zip(texts, found)):
 
         # Earliest start first, longest first; drop spans inside a kept span.
         spans.sort(key=lambda s: (s[0], -(s[1] - s[0])))

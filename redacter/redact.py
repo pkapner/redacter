@@ -11,7 +11,7 @@ from pathlib import Path
 import pymupdf
 
 from .config import Config
-from .detect import Match, find_matches, page_text
+from .detect import Match, find_matches, page_text, value_regex
 
 FILL = (0, 0, 0)
 
@@ -128,32 +128,41 @@ def verify(out: Path, cfg: Config, applied: list[Match], skipped: list[Match]) -
     doc = pymupdf.open(out)
     skipped_texts = {_compact(m.text) for m in skipped}
 
+    leaks: dict[str, None] = {}  # ordered set: one line per distinct leak
+
     # 1. Detection finds nothing new (other than matches the user kept).
     for m in find_matches(doc, cfg):
         if _compact(m.text) not in skipped_texts:
-            result.leaks.append(f"page {m.page + 1}: {m.kind} still detected: {m.text!r}")
+            leaks[f"page {m.page + 1}: {m.kind} still detected: {m.text!r}"] = None
 
-    # 2. No redacted string survives anywhere in the extracted text.
-    pages = [_compact(page_text(p).text) for p in doc]
+    # 2. No redacted value survives anywhere in the extracted text, in any
+    #    formatting (same digit boundaries as detection, so 10075 is not
+    #    reported inside an amount like 1,007,500).
+    pages = [page_text(p).text for p in doc]
     for m in applied:
-        needle = _compact(m.text)
-        if needle in skipped_texts or len(needle) < 4:
+        if _compact(m.text) in skipped_texts or not (rx := value_regex(m.text)):
             continue
         for pno, text in enumerate(pages):
-            if needle in text:
-                result.leaks.append(f"page {pno + 1}: redacted text still present: {m.text!r}")
+            if hit := rx.search(text):
+                ctx = re.sub(r"\s+", " ", text[max(0, hit.start() - 25):hit.end() + 25])
+                leaks[f"page {pno + 1}: redacted value {m.text!r} still present: ...{ctx}..."] = None
 
     # 3. No redacted string survives in the raw, decompressed file bytes
-    #    (metadata, form remnants, stray objects).
+    #    (metadata, form remnants, stray objects). Numbers under 9 digits are
+    #    skipped: they turn up by chance in the file's own structure.
     raw = doc.tobytes(garbage=0, expand=255).lower()
     for m in applied:
         if _compact(m.text) in skipped_texts or len(m.text.strip()) < 4:
             continue
+        digits = re.sub(r"\D", "", m.text)
+        if re.fullmatch(r"[\d\s\-()]+", m.text) and len(digits) < 9:
+            continue
         for needle in _raw_needles(m.text):
             if needle in raw:
-                result.leaks.append(f"raw file bytes still contain {m.text!r}")
+                leaks[f"raw file bytes still contain {m.text!r}"] = None
                 break
 
+    result.leaks = list(leaks)
     doc.close()
     return result
 
