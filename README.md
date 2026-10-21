@@ -37,7 +37,9 @@ time: right-click the app, choose **Open**, then confirm.
 
 ## The app
 
-1. **Drop your PDF** on the window. It's scanned right away. To reuse an
+1. **Drop your PDFs** (or a folder of them) on the window. The first one
+   is scanned right away, and all of them appear in the **Files** list. Click
+   a file to review it; your choices are remembered per file. To reuse an
    existing `redact.toml`, drop it on the window too; the app remembers it.
 2. **Review.** Every match is outlined on the page and listed on the left.
    Red outlines will be redacted, green ones are kept.
@@ -54,6 +56,14 @@ time: right-click the app, choose **Open**, then confirm.
 4. **Redact…** writes the redacted PDF, verifies it, and shows the result.
    Drag the file chip at the bottom straight to Finder, or use Open /
    Show in Finder.
+5. **Redact all files…** (with several files) asks for an output folder and
+   redacts every file in the list in parallel, one process per CPU core,
+   using each file's review choices. Files you didn't open get your normal
+   settings. Any file that fails, such as one needing a password you haven't
+   entered, is listed with the reason.
+
+Scanning and redacting run in the background with a progress bar, so the
+window never freezes.
 
 ## Command line
 

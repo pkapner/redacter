@@ -21,6 +21,10 @@ def selftest() -> int:
         result = redact_file(src, out, Config())
         text = pymupdf.open(out)[0].get_text()
         ok = result.verification.ok and "6789" not in text
+        # the parallel batch path: worker processes must start in the bundle
+        from redacter.batch import BatchJob, run_batch
+        jobs = [BatchJob(i, src, Path(tmp) / f"b{i}.pdf") for i in range(2)]
+        ok = ok and all(r.ok and r.applied == 1 for r in run_batch(jobs, Config(), workers=2))
     from PySide6 import QtWidgets  # the bundled Qt libraries load
     ok = ok and hasattr(QtWidgets, "QApplication")
     print("selftest", "OK" if ok else "FAILED")
@@ -28,6 +32,10 @@ def selftest() -> int:
 
 
 if __name__ == "__main__":
+    # Worker processes of a frozen app re-run this executable; this makes
+    # them run their task instead of starting another copy of the app.
+    import multiprocessing
+    multiprocessing.freeze_support()
     if "--selftest" in sys.argv:
         sys.exit(selftest())
     from redacter.gui import main

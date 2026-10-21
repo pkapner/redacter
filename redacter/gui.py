@@ -9,11 +9,13 @@ from __future__ import annotations
 import re
 import subprocess
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import pymupdf
 from PySide6.QtCore import (
-    QEvent, QMimeData, QPoint, QRect, QRectF, QSettings, QSize, QStandardPaths, Qt, QUrl, Signal,
+    QEvent, QEventLoop, QMimeData, QPoint, QRect, QRectF, QSettings, QSize, QStandardPaths,
+    Qt, QThread, QTimer, QUrl, Signal,
 )
 from PySide6.QtGui import (
     QAction, QActionGroup, QBrush, QColor, QDesktopServices, QDrag, QFont, QImage,
@@ -22,13 +24,14 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QFileDialog, QFrame, QGridLayout,
     QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QListWidget,
-    QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea,
+    QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressDialog, QPushButton, QScrollArea,
     QSizePolicy, QSplitter, QStackedWidget, QStatusBar, QTabWidget, QToolBar, QTreeWidget,
     QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 from .config import BUILTIN_PATTERNS, Box, Config, ConfigError, load_config, save_config
-from .detect import Match, find_matches, page_text, page_warnings
+from .batch import BatchJob, output_paths, run_batch
+from .detect import Match, find_matches, match_key, page_text, page_warnings
 from .redact import PasswordNeeded, RedactError, open_pdf, redact_file, write_review_pdf
 
 PATTERN_HELP = {
@@ -52,10 +55,21 @@ def default_config_path() -> Path:
     return Path(base or Path.home() / ".config" / "redacter") / "redact.toml"
 
 
-def match_key(m: Match) -> tuple:
-    """Identity of a match that survives a rescan (IDs are renumbered)."""
-    r = m.rects[0]
-    return (m.page, " ".join(m.text.split()).casefold(), round(r.x0), round(r.y0))
+@dataclass
+class FileEntry:
+    """One PDF in the file list and the review choices made for it."""
+
+    path: Path
+    password: str | None = None
+    matches: list[Match] | None = None
+    scanned_version: int = -1     # settings version the matches came from
+    warnings: list[str] = field(default_factory=list)
+    kept_keys: set[tuple] = field(default_factory=set)
+    boxes: list[Box] = field(default_factory=list)
+    page_no: int = 0
+    output: Path | None = None
+    status: str = "not scanned"
+    failed: bool = False
 
 
 # --------------------------------------------------------------------------
@@ -220,6 +234,34 @@ class PageView(QWidget):
 
 
 # --------------------------------------------------------------------------
+# Background work
+
+
+class Worker(QThread):
+    """Runs fn(progress) off the UI thread so the window stays responsive.
+
+    The window is disabled while a worker runs, so the UI thread never uses
+    PyMuPDF at the same time (it is not safe to use from two threads at once).
+    """
+
+    progressed = Signal(str, int, int)
+    succeeded = Signal(object)
+    failed = Signal(object)
+
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+
+    def run(self):
+        try:
+            result = self.fn(lambda what, done, total: self.progressed.emit(what, done, total))
+        except Exception as e:  # reported to the user by the window
+            self.failed.emit(e)
+        else:
+            self.succeeded.emit(result)
+
+
+# --------------------------------------------------------------------------
 # Small widgets
 
 
@@ -237,39 +279,47 @@ class DropZone(QLabel):
 
 
 class DraggableFile(QLabel):
-    """Shows a file; drag it out to Finder (or anywhere that takes files)."""
+    """Shows output file(s); drag them out to Finder (or anywhere that takes files)."""
 
     def __init__(self):
         super().__init__()
-        self.path: Path | None = None
+        self.paths: list[Path] = []
         self._press: QPoint | None = None
         self.setCursor(Qt.OpenHandCursor)
         self.setStyleSheet(
             "QLabel { background: #eef6ee; border: 1px solid #7fb27f; border-radius: 6px;"
             " padding: 6px 10px; font-weight: bold; color: #1d4d1d; }")
-        self.setToolTip("Drag this file to Finder, Mail, or anywhere else")
+        self.setToolTip("Drag to Finder, Mail, or anywhere else")
+
+    @property
+    def path(self) -> Path | None:
+        return self.paths[0] if len(self.paths) == 1 else None
 
     def set_path(self, path: Path):
-        self.path = path
-        self.setText(f"📄  {path.name}   ⇢ drag me")
+        self.set_paths([path])
+
+    def set_paths(self, paths: list[Path]):
+        self.paths = list(paths)
+        label = self.paths[0].name if len(self.paths) == 1 else f"{len(self.paths)} redacted PDFs"
+        self.setText(f"📄  {label}   ⇢ drag me")
 
     def mousePressEvent(self, e):
         if e.button() == Qt.LeftButton:
             self._press = e.position().toPoint()
 
     def mouseMoveEvent(self, e):
-        if self._press is None or self.path is None:
+        if self._press is None or not self.paths:
             return
         if (e.position().toPoint() - self._press).manhattanLength() < QApplication.startDragDistance():
             return
         drag = QDrag(self)
         mime = QMimeData()
-        mime.setUrls([QUrl.fromLocalFile(str(self.path))])
+        mime.setUrls([QUrl.fromLocalFile(str(p)) for p in self.paths])
         drag.setMimeData(mime)
         drag.exec(Qt.CopyAction | Qt.MoveAction, Qt.CopyAction)
         self._press = None
-        if not self.path.exists():  # moved away by the drop target
-            self.window().output_moved(self.path)
+        if not any(p.exists() for p in self.paths):  # moved away by the drop target
+            self.window().output_moved(self.paths)
 
 
 # --------------------------------------------------------------------------
@@ -288,6 +338,9 @@ class MainWindow(QMainWindow):
         self.config_path = Path(config_path or saved or default_config_path())
         self.cfg = Config()
 
+        self.entries: list[FileEntry] = []
+        self.current: int | None = None   # index into entries
+        self.cfg_version = 0              # bumped when settings change
         self.src: Path | None = None
         self.password: str | None = None
         self.doc: pymupdf.Document | None = None       # baked original, for display
@@ -298,6 +351,8 @@ class MainWindow(QMainWindow):
         self.boxes: list[Box] = []
         self.page_no = 0
         self.showing_output = False
+        self.worker: Worker | None = None
+        self.progress_dialog: QProgressDialog | None = None
 
         self._build_ui()
         self._load_config(self.config_path, quiet=True)
@@ -307,6 +362,7 @@ class MainWindow(QMainWindow):
 
     def _build_ui(self):
         tb = QToolBar("Main")
+        self.toolbar = tb
         tb.setMovable(False)
         tb.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
         self.addToolBar(tb)
@@ -362,6 +418,13 @@ class MainWindow(QMainWindow):
             "QPushButton:disabled { background: #bbb; }")
         self.btn_redact.clicked.connect(self.redact)
         tb.addWidget(self.btn_redact)
+        self.btn_redact_all = QPushButton("Redact all files…")
+        self.btn_redact_all.setStyleSheet(
+            "QPushButton { background: #8e1c1c; color: white; font-weight: bold;"
+            " padding: 6px 14px; border-radius: 5px; margin-left: 6px; }"
+            "QPushButton:disabled { background: #bbb; }")
+        self.btn_redact_all.clicked.connect(self.redact_all)
+        tb.addWidget(self.btn_redact_all)
 
         # center: drop zone or page
         self.page_view = PageView()
@@ -383,8 +446,28 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self._build_settings_tab(), "Settings")
         self.tabs.setMinimumWidth(380)
 
+        files_panel = QWidget()
+        fl = QVBoxLayout(files_panel)
+        fl.setContentsMargins(0, 0, 0, 0)
+        self.files_label = QLabel("<b>Files</b>")
+        fl.addWidget(self.files_label)
+        self.file_list = QListWidget()
+        self.file_list.setToolTip("Click a file to review it. Right-click to remove it.")
+        self.file_list.currentRowChanged.connect(self._file_row_changed)
+        self.file_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.file_list.customContextMenuRequested.connect(self._file_menu)
+        fl.addWidget(self.file_list)
+        self.files_panel = files_panel
+        files_panel.hide()
+
+        left = QSplitter(Qt.Vertical)
+        left.addWidget(files_panel)
+        left.addWidget(self.tabs)
+        left.setStretchFactor(1, 1)
+        left.setSizes([150, 700])
+
         split = QSplitter()
-        split.addWidget(self.tabs)
+        split.addWidget(left)
         split.addWidget(self.stack)
         split.setStretchFactor(1, 1)
         split.setSizes([430, 870])
@@ -420,11 +503,11 @@ class MainWindow(QMainWindow):
         lay.addWidget(self.summary)
 
         self.tree = QTreeWidget()
-        self.tree.setHeaderLabels(["Redact", "Page", "Type", "Text"])
+        self.tree.setHeaderLabels(["Action", "Page", "Type", "Text"])
         self.tree.setRootIsDecorated(False)
         self.tree.setSelectionMode(QAbstractItemView.SingleSelection)
         self.tree.header().setSectionResizeMode(3, QHeaderView.Stretch)
-        self.tree.itemChanged.connect(self._tree_item_changed)
+        self.tree.itemClicked.connect(self._tree_item_clicked)
         self.tree.currentItemChanged.connect(self._tree_current_changed)
         self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self._tree_menu)
@@ -550,6 +633,7 @@ class MainWindow(QMainWindow):
         save_config(cfg, self.config_path)
         self._config_to_form()
         self.statusBar().showMessage(f"Saved {self.config_path}", 4000)
+        self.cfg_version += 1  # every file's matches are now out of date
         if self.src:
             self.rescan()
         return True
@@ -558,6 +642,7 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(
             self, "Open config", str(self.config_path.parent), "Redacter config (*.toml)")
         if path and self._load_config(Path(path)) and self.src:
+            self.cfg_version += 1
             self.rescan()
 
     def save_config_as(self):
@@ -577,42 +662,153 @@ class MainWindow(QMainWindow):
         paths = [Path(u.toLocalFile()) for u in e.mimeData().urls() if u.isLocalFile()]
         tomls = [p for p in paths if p.suffix.lower() == ".toml"]
         pdfs = [p for p in paths if p.suffix.lower() == ".pdf"]
+        # a dropped folder: take the PDFs inside it
+        for d in (p for p in paths if p.is_dir()):
+            pdfs += sorted(q for q in d.iterdir() if q.suffix.lower() == ".pdf")
         if tomls and self._load_config(tomls[0]):
             self.statusBar().showMessage(f"Using config {tomls[0]}", 4000)
             if self.src and not pdfs:
+                self.cfg_version += 1
                 self.rescan()
         if pdfs:
-            if len(pdfs) > 1:
-                self.statusBar().showMessage("Opened the first PDF; drop the others one at a time", 6000)
-            self.load_pdf(pdfs[0])
+            self.add_files(pdfs)
 
     def choose_pdf(self):
         start = str(self.src.parent) if self.src else str(Path.home())
-        path, _ = QFileDialog.getOpenFileName(self, "Open PDF", start, "PDF files (*.pdf)")
-        if path:
-            self.load_pdf(Path(path))
+        paths, _ = QFileDialog.getOpenFileNames(self, "Open PDFs", start, "PDF files (*.pdf)")
+        if paths:
+            self.add_files([Path(p) for p in paths])
 
     def load_pdf(self, path: Path, password: str | None = None) -> bool:
+        """Add one PDF and show it."""
+        return self.add_files([path], password)
+
+    def add_files(self, paths: list[Path], password: str | None = None) -> bool:
+        """Add PDFs to the file list (skipping ones already there); show the first."""
+        if self.worker is not None:
+            return False
+        known = {e.path.resolve(): i for i, e in enumerate(self.entries)}
+        first = None
+        for p in paths:
+            key = p.resolve()
+            if key in known:
+                first = known[key] if first is None else first
+                continue
+            self.entries.append(FileEntry(p, password))
+            known[key] = len(self.entries) - 1
+            first = len(self.entries) - 1 if first is None else first
+        self._refresh_file_list()
+        if len(paths) > 1:
+            self.statusBar().showMessage(
+                f"{len(self.entries)} files. Review any of them, or use Redact all files…", 6000)
+        return first is not None and self.activate(first)
+
+    def activate(self, index: int) -> bool:
+        """Show entries[index], restoring the choices made for it."""
+        if self.worker is not None:
+            return False
+        entry = self.entries[index]
         try:
-            doc = open_pdf(path, password, prompt=False)
+            doc = open_pdf(entry.path, entry.password, prompt=False)
         except PasswordNeeded as e:
             pw, ok = QInputDialog.getText(self, "Password", f"{e}. Password:", QLineEdit.Password)
-            return self.load_pdf(path, pw) if ok else False
+            if not ok:
+                self._select_row(self.current)
+                return False
+            entry.password = pw
+            return self.activate(index)
         except RedactError as e:
+            entry.status, entry.failed = f"can't open: {e}", True
+            self._refresh_file_list()
             QMessageBox.warning(self, "Can't open", str(e))
             return False
+        self._store_current()
         self._close_docs()
-        self.src, self.password, self.doc = path, password, doc
-        self.kept_keys.clear()
-        self.boxes = []
-        self.page_no = 0
+        self.current = index
+        self.src, self.password, self.doc = entry.path, entry.password, doc
+        # shared objects: edits made while reviewing land in the entry
+        self.kept_keys = entry.kept_keys
+        self.boxes = entry.boxes
+        self.page_no = entry.page_no
         self.showing_output = False
         self.act_view.setChecked(False)
         self.result_bar.hide()
-        self.setWindowTitle(f"Redacter — {path.name}")
+        if entry.output is not None and entry.output.exists() and not entry.failed:
+            self.output = entry.output
+            self.out_doc = pymupdf.open(entry.output)
+            self._show_saved(entry.output, entry.status)
+        self.setWindowTitle(f"Redacter — {entry.path.name}")
         self.stack.setCurrentIndex(1)
-        self.rescan()
+        self._select_row(index)
+        if entry.matches is not None and entry.scanned_version == self.cfg_version:
+            self._scan_done((entry.matches, list(entry.warnings)))
+        else:
+            self.rescan()
         return True
+
+    def _store_current(self):
+        if self.current is not None and self.current < len(self.entries):
+            self.entries[self.current].page_no = self.page_no
+
+    def _select_row(self, row):
+        self.file_list.blockSignals(True)
+        self.file_list.setCurrentRow(-1 if row is None else row)
+        self.file_list.blockSignals(False)
+
+    def _file_row_changed(self, row: int):
+        if 0 <= row < len(self.entries) and row != self.current:
+            self.activate(row)
+
+    def _refresh_file_list(self):
+        self.file_list.blockSignals(True)
+        self.file_list.clear()
+        for e in self.entries:
+            self.file_list.addItem(f"{e.path.name}  —  {e.status}")
+            item = self.file_list.item(self.file_list.count() - 1)
+            item.setToolTip(str(e.path))
+            if e.failed:
+                item.setForeground(QBrush(RED))
+            elif e.output is not None:
+                item.setForeground(QBrush(GREEN))
+        if self.current is not None:
+            self.file_list.setCurrentRow(self.current)
+        self.file_list.blockSignals(False)
+        n = len(self.entries)
+        self.files_label.setText(f"<b>Files</b> ({n})")
+        self.files_panel.setVisible(n > 0)
+        self._update_enabled()
+
+    def _file_menu(self, pos):
+        item = self.file_list.itemAt(pos)
+        if item is None or self.worker is not None:
+            return
+        row = self.file_list.row(item)
+        menu = QMenu(self)
+        remove = menu.addAction("Remove from list")
+        if menu.exec(self.file_list.viewport().mapToGlobal(pos)) == remove:
+            self.remove_file(row)
+
+    def remove_file(self, row: int):
+        del self.entries[row]
+        if self.current == row:
+            self.current = None
+            self._close_docs()
+            self.matches = []
+            if self.entries:
+                self._refresh_file_list()
+                self.activate(min(row, len(self.entries) - 1))
+                return
+            self.src = self.doc = None
+            self.kept_keys, self.boxes = set(), []
+            self.tree.clear()
+            self.warnings.clear()
+            self.result_bar.hide()
+            self.summary.setText("Drop a PDF to start.")
+            self.setWindowTitle("Redacter")
+            self.stack.setCurrentIndex(0)
+        elif self.current is not None and self.current > row:
+            self.current -= 1
+        self._refresh_file_list()
 
     def _close_docs(self):
         self.page_view.set_page(None)
@@ -626,14 +822,24 @@ class MainWindow(QMainWindow):
     def rescan(self):
         if self.doc is None:
             return
-        QApplication.setOverrideCursor(Qt.WaitCursor)
-        self.statusBar().showMessage("Scanning…")
-        QApplication.processEvents()
-        try:
-            self.matches = find_matches(self.doc, self.cfg)
-            warnings = page_warnings(self.doc)
-        finally:
-            QApplication.restoreOverrideCursor()
+        doc, cfg = self.doc, self.cfg
+
+        def work(progress):
+            matches = find_matches(doc, cfg, progress)
+            progress("Checking pages for images", 0, 1)
+            return matches, page_warnings(doc)
+
+        self.run_task("Scanning", work, self._scan_done)
+
+    def _scan_done(self, result):
+        self.matches, warnings = result
+        if self.current is not None:
+            entry = self.entries[self.current]
+            entry.matches, entry.warnings = self.matches, list(warnings)
+            entry.scanned_version = self.cfg_version
+            if entry.output is None and not entry.failed:
+                entry.status = f"{len(self.matches)} matches"
+            self._refresh_file_list()
         if not self.cfg.terms:
             warnings.insert(0, "No terms set, so names and addresses will NOT be "
                                "redacted. Add them in Settings.")
@@ -656,12 +862,13 @@ class MainWindow(QMainWindow):
         for m in self.matches:
             it = QTreeWidgetItem(["", str(m.page + 1), m.kind, " ".join(m.text.split())])
             it.setData(0, Qt.UserRole, ("match", m.id))
-            it.setCheckState(0, Qt.Unchecked if m.id in kept else Qt.Checked)
+            self._show_state(it, m.id in kept)
             it.setToolTip(3, m.context)
             self.tree.addTopLevelItem(it)
         for i, b in enumerate(self.boxes):
-            it = QTreeWidgetItem(["", str(b.page), "manual box", "right-click to remove"])
+            it = QTreeWidgetItem(["Box", str(b.page), "manual box", "right-click to remove"])
             it.setData(0, Qt.UserRole, ("box", i))
+            it.setForeground(0, QBrush(BLUE))
             it.setForeground(2, QBrush(BLUE))
             self.tree.addTopLevelItem(it)
         for col in range(3):
@@ -677,19 +884,29 @@ class MainWindow(QMainWindow):
             f"<b>{n - kept}</b> of {n} matches will be redacted"
             + (f", <b>{kept}</b> kept" if kept else "")
             + (f", plus <b>{boxes}</b> box(es)" if boxes else "")
-            + ".<br><span style='color:#777'>Click a match on the page (or untick it here) "
-              "to keep it. Use Draw box / Add term for anything missed.</span>")
+            + ".<br><span style='color:#888'>Click a match on the page, or its Redact/Keep "
+              "label here, to switch it. Use Draw box / Add term for anything missed.</span>")
         self._update_enabled()
 
-    def _tree_item_changed(self, item: QTreeWidgetItem, col: int):
+    @staticmethod
+    def _show_state(item: QTreeWidgetItem, kept: bool):
+        # A coloured word rather than a checkbox: checkboxes in item views
+        # are nearly invisible in macOS dark mode.
+        item.setText(0, "Keep" if kept else "Redact")
+        item.setForeground(0, QBrush(GREEN if kept else RED))
+        f = item.font(0)
+        f.setBold(True)
+        item.setFont(0, f)
+        item.setToolTip(0, "Click to " + ("redact this" if kept else "keep this unredacted"))
+
+    def _tree_item_clicked(self, item: QTreeWidgetItem, col: int):
         kind, ident = item.data(0, Qt.UserRole)
         if kind != "match" or col != 0:
             return
-        m = self._match(ident)
-        if item.checkState(0) == Qt.Checked:
-            self.kept_keys.discard(match_key(m))
-        else:
-            self.kept_keys.add(match_key(m))
+        key = match_key(self._match(ident))
+        kept = key not in self.kept_keys
+        (self.kept_keys.add if kept else self.kept_keys.discard)(key)
+        self._show_state(item, kept)
         self._invalidate_output()
         self._update_summary()
         self._refresh_page()
@@ -740,7 +957,9 @@ class MainWindow(QMainWindow):
         self._refresh_page()
 
     def set_all_kept(self, kept: bool):
-        self.kept_keys = {match_key(m) for m in self.matches} if kept else set()
+        self.kept_keys.clear()
+        if kept:
+            self.kept_keys.update(match_key(m) for m in self.matches)
         self._invalidate_output()
         self._fill_tree()
         self._refresh_page()
@@ -850,6 +1069,8 @@ class MainWindow(QMainWindow):
                   self.act_review, *self.mode_actions.values()):
             a.setEnabled(loaded)
         self.btn_redact.setEnabled(loaded)
+        self.btn_redact_all.setEnabled(len(self.entries) > 1)
+        self.btn_redact_all.setVisible(len(self.entries) > 1)
         self.act_view.setEnabled(self.out_doc is not None)
 
     # outputs -------------------------------------------------------------
@@ -865,27 +1086,31 @@ class MainWindow(QMainWindow):
         if path:
             self.redact_to(Path(path))
 
-    def redact_to(self, out: Path) -> bool:
+    def redact_to(self, out: Path):
+        """Redact to out in the background; the result shows when done."""
         if out.suffix.lower() != ".pdf":
             out = out.with_suffix(".pdf")
         if self.out_doc is not None:  # may be the file being overwritten
             self.out_doc.close()
             self.out_doc = None
             self.showing_output = False
-        QApplication.setOverrideCursor(Qt.WaitCursor)
-        self.statusBar().showMessage("Redacting and verifying…")
-        QApplication.processEvents()
-        try:
-            result = redact_file(self.src, out, self.cfg, self.matches, self.kept_ids(),
-                                 self.boxes, self.password)
-        except RedactError as e:
-            QApplication.restoreOverrideCursor()
-            QMessageBox.warning(self, "Redaction failed", str(e))
-            return False
-        QApplication.restoreOverrideCursor()
+        args = (self.src, out, self.cfg, self.matches, self.kept_ids(),
+                list(self.boxes), self.password)
 
+        def work(progress):
+            return redact_file(*args, progress=progress)
+
+        self.run_task("Redacting", work, lambda result: self._redact_done(out, result))
+
+    def _redact_done(self, out: Path, result):
         self.result_bar.show()
         v = result.verification
+        entry = self.entries[self.current] if self.current is not None else None
+        if entry is not None:
+            entry.failed = not v.ok
+            entry.output = out if v.ok else None
+            entry.status = "✓ redacted" if v.ok else "✗ verification failed"
+            self._refresh_file_list()
         if not v.ok:
             self.result_file.hide()
             self.btn_open_out.hide()
@@ -896,25 +1121,150 @@ class MainWindow(QMainWindow):
                 + "<br>".join(f"• {leak}" for leak in v.leaks[:8])
                 + ("<br>…" if len(v.leaks) > 8 else ""))
             self.statusBar().showMessage("Verification failed", 6000)
-            return False
+            return
 
         self.output = out
         self.out_doc = pymupdf.open(out)
-        self.result_file.set_path(out)
-        for w in (self.result_file, self.btn_open_out, self.btn_reveal):
-            w.show()
         kept = len(result.skipped)
-        self.result_label.setText(
-            f"<b style='color:#2e7d32'>✓ Redacted and verified.</b> "
-            f"{len(result.applied)} matches"
+        self._show_saved(
+            out, f"{len(result.applied)} matches"
             + (f" and {result.boxes} box(es)" if result.boxes else "")
-            + " removed" + (f", {kept} kept" if kept else "")
-            + ". Check pages with images yourself before sharing.")
+            + " removed" + (f", {kept} kept" if kept else ""))
         self.act_view.setEnabled(True)
         self.act_view.setChecked(True)
         self.toggle_output_view(True)
         self.statusBar().showMessage(f"Saved {out}", 6000)
-        return True
+
+    def _show_saved(self, out: Path, detail: str):
+        self.result_bar.show()
+        self.result_file.set_path(out)
+        for w in (self.result_file, self.btn_open_out, self.btn_reveal):
+            w.show()
+        self.result_label.setText(
+            f"<b style='color:#2e7d32'>✓ Redacted and verified.</b> {detail}. "
+            "Check pages with images yourself before sharing.")
+
+    def redact_all(self):
+        if not self.entries:
+            return
+        start = str(self.entries[0].path.parent)
+        folder = QFileDialog.getExistingDirectory(
+            self, "Save redacted PDFs into folder", start)
+        if folder:
+            self.redact_all_to(Path(folder))
+
+    def redact_all_to(self, folder: Path):
+        """Redact every file in the list into folder, in parallel processes."""
+        self._store_current()
+        outs = output_paths([e.path for e in self.entries], folder)
+        jobs = [BatchJob(i, e.path, out, e.password, set(e.kept_keys), list(e.boxes))
+                for i, (e, out) in enumerate(zip(self.entries, outs))]
+        cfg = self.cfg
+        if self.out_doc is not None:  # its file may be overwritten
+            self.out_doc.close()
+            self.out_doc = None
+            self.showing_output = False
+        self.run_task("Redacting all files", lambda progress: run_batch(jobs, cfg, progress),
+                      lambda results: self._batch_done(folder, results))
+
+    def _batch_done(self, folder: Path, results):
+        good = []
+        problems = []
+        for r in results:
+            entry = self.entries[r.index]
+            entry.failed = not r.ok
+            if r.ok:
+                entry.output = r.out
+                entry.status = f"✓ redacted ({r.applied} removed)"
+                good.append(r.out)
+            else:
+                entry.output = None
+                reason = r.error or "verification failed: " + "; ".join(r.leaks[:2])
+                entry.status = f"✗ {reason}"
+                problems.append(f"• {entry.path.name}: {reason}")
+        self._refresh_file_list()
+        self.result_bar.show()
+        self.output = folder
+        if good:
+            self.result_file.set_paths(good)
+            self.result_file.show()
+        else:
+            self.result_file.hide()
+        self.btn_open_out.hide()
+        self.btn_reveal.setVisible(bool(good))
+        head = (f"<b style='color:#2e7d32'>✓ {len(good)} of {len(results)} files redacted "
+                f"and verified</b> into {folder}." if good else
+                "<b style='color:#c62828'>No files were redacted.</b>")
+        if problems:
+            head += "<br><b style='color:#c62828'>Not redacted:</b><br>" + "<br>".join(problems[:6])
+            if len(problems) > 6:
+                head += "<br>…"
+        self.result_label.setText(head + "<br>Check pages with images yourself before sharing.")
+        cur = self.entries[self.current] if self.current is not None else None
+        if cur is not None and cur.output is not None:
+            self.out_doc = pymupdf.open(cur.output)
+            self.act_view.setEnabled(True)
+        self.statusBar().showMessage(f"Batch done: {len(good)} of {len(results)} redacted", 8000)
+
+    # background tasks ----------------------------------------------------
+
+    def run_task(self, title: str, fn, on_done):
+        """Run fn(progress) in a worker with a progress dialog, then on_done."""
+        if self.worker is not None:
+            return
+        self.centralWidget().setEnabled(False)
+        self.toolbar.setEnabled(False)
+        dlg = QProgressDialog(f"{title}…", None, 0, 0, self)
+        dlg.setWindowTitle(title)
+        dlg.setWindowModality(Qt.WindowModal)
+        dlg.setMinimumDuration(0)
+        dlg.setMinimumWidth(360)
+        dlg.setAutoClose(False)
+        dlg.setAutoReset(False)
+        dlg.show()
+        self.progress_dialog = dlg
+
+        def progressed(what, done, total):
+            dlg.setMaximum(max(total, 1) if total > 1 else 0)  # 0 = busy bar
+            dlg.setValue(done)
+            dlg.setLabelText(f"{what}… {done + 1} of {total}" if total > 1 else f"{what}…")
+            self.statusBar().showMessage(dlg.labelText())
+
+        def finish():
+            dlg.close()
+            self.progress_dialog = None
+            self.worker = None
+            self.centralWidget().setEnabled(True)
+            self.toolbar.setEnabled(True)
+            self._update_enabled()
+
+        def succeeded(result):
+            finish()
+            on_done(result)
+
+        def failed(error):
+            finish()
+            QMessageBox.warning(self, f"{title} failed", str(error))
+            self.statusBar().showMessage(f"{title} failed", 6000)
+
+        worker = Worker(fn)
+        worker.progressed.connect(progressed)
+        worker.succeeded.connect(succeeded)
+        worker.failed.connect(failed)
+        worker.finished.connect(worker.deleteLater)
+        self.worker = worker
+        worker.start()
+
+    def wait_idle(self, timeout_ms: int = 60000) -> None:
+        """Block (processing events) until the current task is done."""
+        loop = QEventLoop()
+        timer = QTimer()
+        timer.timeout.connect(lambda: loop.quit() if self.worker is None else None)
+        timer.start(20)
+        QTimer.singleShot(timeout_ms, loop.quit)
+        if self.worker is not None:
+            loop.exec()
+        timer.stop()
 
     def save_review(self):
         if self.src is None:
@@ -943,17 +1293,22 @@ class MainWindow(QMainWindow):
     def reveal_output(self):
         if not self.output:
             return
+        if self.output.is_dir():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.output)))
+            return
         if sys.platform == "darwin":
             subprocess.run(["open", "-R", str(self.output)], check=False)
         else:
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.output.parent)))
 
-    def output_moved(self, old: Path):
-        self.result_label.setText("Moved the redacted PDF out of its folder.")
+    def output_moved(self, old: list[Path]):
+        self.result_label.setText("Moved the redacted PDF(s) out of the folder.")
         self.btn_open_out.hide()
         self.btn_reveal.hide()
 
     def closeEvent(self, e):
+        if self.worker is not None:  # let it finish; its document is in use
+            self.wait_idle()
         self._close_docs()
         super().closeEvent(e)
 

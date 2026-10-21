@@ -10,9 +10,11 @@ rectangles to black out.
 
 from __future__ import annotations
 
+import bisect
 import re
 import unicodedata
 from dataclasses import dataclass, field
+from typing import Callable
 
 import pymupdf
 
@@ -202,6 +204,12 @@ def _norm(s: str) -> str:
     return " ".join(s.split()).casefold()
 
 
+def match_key(m: Match) -> tuple:
+    """Identity of a match that survives a rescan (IDs are renumbered)."""
+    r = m.rects[0]
+    return (m.page, " ".join(m.text.split()).casefold(), round(r.x0), round(r.y0))
+
+
 def value_regex(text: str) -> re.Pattern | None:
     """Regex for other copies of an already-found value, in any formatting.
 
@@ -220,10 +228,18 @@ def value_regex(text: str) -> re.Pattern | None:
     return term_regex(text)
 
 
-def find_matches(doc: pymupdf.Document, cfg: Config) -> list[Match]:
+Progress = Callable[[str, int, int], None]  # (what, done, total)
+
+
+def find_matches(doc: pymupdf.Document, cfg: Config,
+                 progress: Progress | None = None) -> list[Match]:
     patterns = cfg.compiled_patterns()
     allowed = {_norm(a) for a in cfg.allow}
-    texts = [page_text(page) for page in doc]
+    texts = []
+    for pno, page in enumerate(doc):
+        if progress:
+            progress("Reading pages", pno, doc.page_count)
+        texts.append(page_text(page))
 
     # First pass: every pattern on every page.
     found: list[list[tuple[int, int, str]]] = []
@@ -256,18 +272,24 @@ def find_matches(doc: pymupdf.Document, cfg: Config) -> list[Match]:
     for pno, (pt, spans) in enumerate(zip(texts, found)):
 
         # Earliest start first, longest first; drop spans inside a kept span.
+        # Every kept span starts at or before s, so s lies inside one of them
+        # exactly when the furthest kept end reaches s's end.
         spans.sort(key=lambda s: (s[0], -(s[1] - s[0])))
         kept = []
+        furthest = -1
         for s in spans:
-            if any(k[0] <= s[0] and s[1] <= k[1] for k in kept):
+            if s[1] <= furthest:
                 continue
             kept.append(s)
+            furthest = s[1]
+
+        index = GlyphIndex(pt.chars) if kept else None
 
         for start, end, kind in kept:
             text = pt.text[start:end]
             if _norm(text) in allowed:
                 continue
-            rects, cut_rects = _rects_for(pt.chars[start:end], pt.chars)
+            rects, cut_rects = _rects_for(pt.chars[start:end], index)
             if not rects:
                 # Never drop a match silently: it would be neither shown nor
                 # redacted. Degenerate boxes are rebuilt upstream, so this is a bug.
@@ -282,8 +304,30 @@ def find_matches(doc: pymupdf.Document, cfg: Config) -> list[Match]:
     return matches
 
 
+class GlyphIndex:
+    """Glyph boxes of a page sorted by top edge, for fast "what is near this
+    band" queries (a page can hold thousands of glyphs and hundreds of
+    matches, so scanning every glyph per match is far too slow)."""
+
+    def __init__(self, chars: list[Char]):
+        boxes = sorted(
+            (b.y0, b.y1, b.x0, b.x1, ch.row)
+            for ch in chars
+            if (b := ch.bbox) is not None and b.x1 > b.x0 and b.y1 > b.y0
+        )
+        self.boxes = boxes
+        self.tops = [b[0] for b in boxes]
+        self.tallest = max((b[1] - b[0] for b in boxes), default=0.0)
+
+    def near(self, top: float, bottom: float):
+        """Boxes that may overlap the vertical band [top, bottom]."""
+        lo = bisect.bisect_left(self.tops, top - self.tallest)
+        hi = bisect.bisect_right(self.tops, bottom)
+        return self.boxes[lo:hi]
+
+
 def _rects_for(
-    chars: list[Char], page_chars: list[Char]
+    chars: list[Char], index: GlyphIndex
 ) -> tuple[list[pymupdf.Rect], list[pymupdf.Rect]]:
     """Return (cover, cut) rectangles, one of each per row of the match.
 
@@ -317,15 +361,13 @@ def _rects_for(
         # from any other row's glyph box that overlaps it horizontally.
         top, bottom = baseline - 0.7 * size, baseline + 0.1 * size
         mid = baseline - 0.35 * size
-        for other in page_chars:
-            b = other.bbox
-            if (other.row == row or b is None or b.is_empty
-                    or b.x1 <= full.x0 or b.x0 >= full.x1):
+        for y0, y1, x0, x1, other_row in index.near(top, bottom):
+            if other_row == row or x1 <= full.x0 or x0 >= full.x1:
                 continue
-            if b.y1 <= mid and b.y1 > top:
-                top = b.y1 + 0.01
-            elif b.y0 >= mid and b.y0 < bottom:
-                bottom = b.y0 - 0.01
+            if y1 <= mid and y1 > top:
+                top = y1 + 0.01
+            elif y0 >= mid and y0 < bottom:
+                bottom = y0 - 0.01
         if bottom - top < 0.1 * size:
             # Overlapping rows: removing this text without touching the
             # neighbours is impossible. Remove it anyway; verification and

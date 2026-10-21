@@ -12,7 +12,7 @@ from pathlib import Path
 import pymupdf
 
 from .config import Box, Config
-from .detect import Match, find_matches, page_text, value_regex
+from .detect import Match, Progress, find_matches, page_text, value_regex
 
 FILL = (0, 0, 0)
 
@@ -53,6 +53,7 @@ def redact_document(
     cfg: Config,
     skip: set[int],
     boxes: list[Box] = (),
+    progress: Progress | None = None,
 ) -> list[Match]:
     """Black out matches (minus skipped IDs) and manual boxes, then sanitize.
 
@@ -60,12 +61,15 @@ def redact_document(
     matches that were redacted.
     """
     applied = [m for m in matches if m.id not in skip]
-    covers: dict[int, list[pymupdf.Rect]] = {}
+    cuts: dict[int, set[tuple]] = {}
+    covers: dict[int, set[tuple]] = {}
     for m in applied:
-        page = doc[m.page]
-        for r in m.cut_rects:
-            page.add_redact_annot(r, fill=FILL, cross_out=False)
-        covers.setdefault(m.page, []).extend(m.rects)
+        cuts.setdefault(m.page, set()).update(tuple(r) for r in m.cut_rects)
+        covers.setdefault(m.page, set()).update(tuple(r) for r in m.rects)
+    for pno, rects in cuts.items():
+        page = doc[pno]
+        for r in sorted(rects):
+            page.add_redact_annot(pymupdf.Rect(r), fill=FILL, cross_out=False)
 
     for box in [*cfg.boxes, *boxes]:
         if box.page > doc.page_count:
@@ -75,6 +79,8 @@ def redact_document(
         doc[box.page - 1].add_redact_annot(pymupdf.Rect(box.rect), fill=FILL, cross_out=False)
 
     for page in doc:
+        if progress:
+            progress("Redacting pages", page.number, doc.page_count)
         # Remove text under the boxes, blank out covered image pixels, and
         # drop vector graphics fully inside a box.
         page.apply_redactions(
@@ -82,8 +88,13 @@ def redact_document(
             graphics=pymupdf.PDF_REDACT_LINE_ART_REMOVE_IF_COVERED,
             text=pymupdf.PDF_REDACT_TEXT_REMOVE,
         )
-        for r in covers.get(page.number, []):
-            page.draw_rect(r, color=None, fill=FILL, overlay=True)
+        rects = covers.get(page.number)
+        if rects:  # all black boxes of a page in one drawing
+            shape = page.new_shape()
+            for r in sorted(rects):
+                shape.draw_rect(pymupdf.Rect(r))
+            shape.finish(color=None, fill=FILL, width=0)
+            shape.commit(overlay=True)
 
     sanitize(doc)
     return applied
@@ -193,6 +204,7 @@ def redact_file(
     skip: set[int] = frozenset(),
     boxes: list[Box] = (),
     password: str | None = None,
+    progress: Progress | None = None,
 ) -> RedactResult:
     """Write a redacted, verified copy of src to out.
 
@@ -204,12 +216,14 @@ def redact_file(
         raise RedactError("output must differ from input")
     doc = open_pdf(src, password, prompt=False)
     if matches is None:
-        matches = find_matches(doc, cfg)
-    applied = redact_document(doc, matches, cfg, skip, boxes)
+        matches = find_matches(doc, cfg, progress)
+    applied = redact_document(doc, matches, cfg, skip, boxes, progress)
     skipped = [m for m in matches if m.id in skip]
+    if progress:
+        progress("Saving", 0, 1)
     save(doc, out)
     doc.close()
-    result = verify(out, cfg, applied, skipped)
+    result = verify(out, cfg, applied, skipped, progress)
     if not result.ok:
         out.unlink()
     return RedactResult(applied, skipped, len(cfg.boxes) + len(boxes), result)
@@ -241,53 +255,94 @@ class Verification:
         return not self.leaks
 
 
-def verify(out: Path, cfg: Config, applied: list[Match], skipped: list[Match]) -> Verification:
+def verify(out: Path, cfg: Config, applied: list[Match], skipped: list[Match],
+           progress: Progress | None = None) -> Verification:
     """Re-open the output and check nothing that should be gone is still there."""
     result = Verification()
     doc = pymupdf.open(out)
     skipped_texts = {_compact(m.text) for m in skipped}
-
     leaks: dict[str, None] = {}  # ordered set: one line per distinct leak
 
+    def step(what, done=0, total=1):
+        if progress:
+            progress(what, done, total)
+
+    # Each distinct redacted value once: the same name or number is often
+    # matched dozens of times across a return.
+    values: dict[str, str] = {}
+    for m in applied:
+        key = _compact(m.text)
+        if key and key not in skipped_texts:
+            values.setdefault(key, m.text)
+
     # 1. Detection finds nothing new (other than matches the user kept).
-    for m in find_matches(doc, cfg):
+    verify_progress = (lambda w, d, t: step("Verifying: re-reading pages", d, t)) if progress else None
+    for m in find_matches(doc, cfg, verify_progress):
         if _compact(m.text) not in skipped_texts:
             leaks[f"page {m.page + 1}: {m.kind} still detected: {m.text!r}"] = None
 
     # 2. No redacted value survives anywhere in the extracted text, in any
     #    formatting (same digit boundaries as detection, so 10075 is not
     #    reported inside an amount like 1,007,500).
+    step("Verifying: searching text")
     pages = [page_text(p).text for p in doc]
-    for m in applied:
-        if _compact(m.text) in skipped_texts or not (rx := value_regex(m.text)):
+    for text_value in values.values():
+        rx = value_regex(text_value)
+        if rx is None:
             continue
         for pno, text in enumerate(pages):
             if hit := rx.search(text):
                 ctx = re.sub(r"\s+", " ", text[max(0, hit.start() - 25):hit.end() + 25])
-                leaks[f"page {pno + 1}: redacted value {m.text!r} still present: ...{ctx}..."] = None
+                leaks[f"page {pno + 1}: redacted value {text_value!r} still present: ...{ctx}..."] = None
 
-    # 3. No redacted string survives in the raw, decompressed file bytes
-    #    (metadata, form remnants, stray objects). Numbers under 9 digits are
-    #    skipped: they turn up by chance in the file's own structure.
-    raw = doc.tobytes(garbage=0, expand=255).lower()
-    for m in applied:
-        if _compact(m.text) in skipped_texts or len(m.text.strip()) < 4:
+    # 3. No redacted string survives in the file's raw bytes: object
+    #    definitions (metadata, form remnants, stray strings) and decompressed
+    #    page drawing commands. Image and font data are skipped (binary, and
+    #    image metadata is checked in step 4). Numbers under 9 digits are
+    #    skipped too: they turn up by chance in the file's own structure.
+    step("Verifying: searching file bytes")
+    needles: dict[bytes, str] = {}
+    for text_value in values.values():
+        if len(text_value.strip()) < 4:
             continue
-        digits = re.sub(r"\D", "", m.text)
-        if re.fullmatch(r"[\d\s\-()]+", m.text) and len(digits) < 9:
+        digits = re.sub(r"\D", "", text_value)
+        if re.fullmatch(r"[\d\s\-()]+", text_value) and len(digits) < 9:
             continue
-        for needle in _raw_needles(m.text):
-            if needle in raw:
-                leaks[f"raw file bytes still contain {m.text!r}"] = None
-                break
+        for needle in _raw_needles(text_value):
+            needles.setdefault(needle, text_value)
+    if needles:
+        rx = re.compile(b"|".join(re.escape(n) for n in sorted(needles, key=len, reverse=True)))
+        for hit in set(rx.findall(_searchable_bytes(doc))):
+            leaks[f"raw file bytes still contain {needles[hit]!r}"] = None
 
     # 4. No metadata stores survive anywhere in the file.
+    step("Verifying: checking metadata")
     for issue in metadata_leftovers(doc):
         leaks[issue] = None
 
     result.leaks = list(leaks)
     doc.close()
     return result
+
+
+def _searchable_bytes(doc: pymupdf.Document) -> bytes:
+    """The file's objects and non-binary streams, decompressed, lowercased."""
+    parts = [doc.pdf_trailer().encode("latin-1", "replace")]
+    for xref in range(1, doc.xref_length()):
+        obj = doc.xref_object(xref, compressed=False)
+        parts.append(obj.encode("latin-1", "replace"))
+        if not doc.xref_is_stream(xref):
+            continue
+        binary = (
+            doc.xref_get_key(xref, "Subtype")[1] in ("/Image", "/Type1C", "/CIDFontType0C", "/OpenType")
+            or any(doc.xref_get_key(xref, k)[0] != "null" for k in ("Length1", "Length2", "Length3"))
+        )
+        if not binary:
+            try:
+                parts.append(doc.xref_stream(xref) or b"")
+            except Exception:  # undecodable stream: search it as stored
+                parts.append(doc.xref_stream_raw(xref) or b"")
+    return b"\n".join(parts).lower()
 
 
 def metadata_leftovers(doc: pymupdf.Document) -> list[str]:

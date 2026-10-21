@@ -454,3 +454,24 @@ def test_strip_jpeg_metadata_keeps_decoding_blocks():
     data = b"\xff\xd8" + jfif + exif + icc + com + adobe + tail
     assert strip_jpeg_metadata(data) == b"\xff\xd8" + jfif + icc + adobe + tail
     assert strip_jpeg_metadata(b"not a jpeg") == b"not a jpeg"
+
+
+def test_batch_runs_in_parallel_processes(tmp_path):
+    from redacter.batch import BatchJob, output_paths, run_batch
+    srcs = [make_return(tmp_path / f"r{i}.pdf") for i in range(3)]
+    (tmp_path / "bad.pdf").write_bytes(b"not a pdf")
+    srcs.append(tmp_path / "bad.pdf")
+    outs = output_paths(srcs, tmp_path)
+    jobs = [BatchJob(i, s, o) for i, (s, o) in enumerate(zip(srcs, outs))]
+    seen = []
+    results = run_batch(jobs, Config(), lambda *a: seen.append(a), workers=2)
+    assert [r.ok for r in results] == [True, True, True, False]
+    assert "cannot open" in results[3].error
+    assert all(SSN not in all_text(o) for o in outs[:3])
+    assert seen and seen[-1][1] == 4
+
+
+def test_output_paths_are_unique():
+    from redacter.batch import output_paths
+    outs = output_paths([Path("/a/x.pdf"), Path("/b/x.pdf"), Path("/c/y.pdf")], Path("/o"))
+    assert [p.name for p in outs] == ["x.redacted.pdf", "x.redacted-2.pdf", "y.redacted.pdf"]
