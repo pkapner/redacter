@@ -18,14 +18,22 @@ python3 -m venv .venv
 .venv/bin/pip install -e '.[gui]'      # drop [gui] for the command line only
 ```
 
-On a Mac, build a double-clickable app (into `~/Applications`):
+Start the app with `.venv/bin/redacter-gui`, or build a Mac app:
+
+### Mac app (.dmg)
 
 ```sh
-scripts/make-mac-app.sh
+scripts/build-dmg.sh        # on a Mac; writes dist/Redacter.dmg
 ```
 
-You can then drop PDFs on its Dock icon. Without the bundle, start the app
-with `.venv/bin/redacter-gui`.
+This builds a self-contained `Redacter.app`, with Python and every library
+inside, on a disk image. Open the `.dmg` and drag Redacter to Applications.
+You can then drop PDFs on its Dock icon, or use **Open With → Redacter** in
+Finder.
+
+The app is signed ad hoc, not with an Apple Developer ID. It opens normally
+on the Mac that built it. On another Mac, macOS will block it the first
+time: right-click the app, choose **Open**, then confirm.
 
 ## The app
 

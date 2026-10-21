@@ -9,3 +9,7 @@ redact.toml
 *.pdf
 preview*/
 *.png
+
+# Build output
+.build-venv/
+dist/
