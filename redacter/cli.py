@@ -42,6 +42,8 @@ def main(argv: list[str] | None = None) -> int:
     p_scan.add_argument("--skip", default="", metavar="IDS",
                         help="match IDs to keep, e.g. 3,7 (shown in green in the preview)")
     p_scan.add_argument("--json", action="store_true", help="print matches as JSON")
+    p_scan.add_argument("--mask", action="store_true",
+                        help="hide digits in the listing (#), for sharing it")
 
     p_apply = sub.add_parser("apply", help="write a redacted copy and verify it")
     common(p_apply)
@@ -150,7 +152,7 @@ def cmd_scan(args, cfg, skip: set[int]) -> int:
             for m in matches
         ], indent=2))
     else:
-        _print_table(matches, skip)
+        _print_table(matches, skip, args.mask)
         if cfg.boxes:
             print(f"\nplus {len(cfg.boxes)} manual box(es) from the config")
         _print_warnings(doc, cfg)
@@ -226,7 +228,7 @@ def _check_skip(skip: set[int], matches) -> None:
         )
 
 
-def _print_table(matches, skip: set[int]) -> None:
+def _print_table(matches, skip: set[int], mask: bool = False) -> None:
     if not matches:
         print("no matches")
         return
@@ -236,8 +238,11 @@ def _print_table(matches, skip: set[int]) -> None:
     for m in matches:
         mark = "  (skip)" if m.id in skip else ""
         text = m.text.replace("\n", " ").replace("\t", " ")
+        context = m.context
+        if mask:
+            text, context = mask_text(text), mask_text(context)
         print(f"{m.id:>4}  {m.page + 1:>4}  {m.kind:<{w_kind}}  "
-              f"{text[:w_text]:<{w_text}}  {m.context}{mark}")
+              f"{text[:w_text]:<{w_text}}  {context}{mark}")
     print(f"\n{len(matches)} match(es); {len(skip)} skipped")
 
 
