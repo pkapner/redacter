@@ -10,7 +10,9 @@ from pathlib import Path
 
 from . import __version__
 from .config import BUILTIN_PATTERNS, ConfigError, load_config
-from .detect import find_matches, page_text, page_warnings
+import pymupdf
+
+from .detect import TEXT_FLAGS, find_matches, mask_text, page_warnings
 from .redact import RedactError, open_pdf, redact_document, render_preview, save, verify
 
 EXAMPLE_CONFIG = Path(__file__).with_name("redact.example.toml")
@@ -56,7 +58,8 @@ def main(argv: list[str] | None = None) -> int:
         "inspect", help="show how the text near a label is read, digits masked")
     p_inspect.add_argument("input", type=Path)
     p_inspect.add_argument("label", help='text to look for, e.g. "social security"')
-    p_inspect.add_argument("--rows", type=int, default=3, help="rows to show after the label")
+    p_inspect.add_argument("--below", type=float, default=60,
+                           help="points below the label to include (default 60)")
     p_inspect.add_argument("--password")
 
     args = parser.parse_args(argv)
@@ -88,46 +91,49 @@ def cmd_init(args) -> int:
 
 
 def cmd_inspect(args) -> int:
-    """Print the rows around a label as the detector sees them.
+    """Show what the PDF holds around a label, without revealing any numbers.
 
-    Digits are replaced with '#', so the output can be shared to debug a
-    missed match without revealing the number itself. Gaps the tool filled
-    in are shown as a middle dot (space) or an arrow (wide gap / tab).
+    Prints every text span near the label (by position, not reading order)
+    with its font, and masks characters by class, so the output can be shared
+    to debug a missed match. Also counts images and drawn shapes nearby,
+    which text search cannot see.
     """
     doc = open_pdf(args.input, args.password)
-    needle = " ".join(args.label.split()).casefold()
     found = False
     for pno, page in enumerate(doc):
-        pt = page_text(page)
-        rows: dict[int, list] = {}
-        for ch in pt.chars:
-            if ch.c != "\n":
-                rows.setdefault(ch.row, []).append(ch)
-        for r, chars in rows.items():
-            line = " ".join("".join(c.c for c in chars).split()).casefold()
-            if needle not in line:
-                continue
+        for label in page.search_for(args.label):
             found = True
-            print(f"page {pno + 1}:")
-            for rr in range(r, r + args.rows + 1):
-                if rr not in rows:
+            region = pymupdf.Rect(label.x0 - 40, label.y0 - 2,
+                                  label.x1 + 350, label.y1 + args.below)
+            print(f"page {pno + 1}: label at x={label.x0:.0f} y={label.y0:.0f}, "
+                  f"showing {region.width:.0f}x{region.height:.0f}pt below/right of it")
+            raw = page.get_text("rawdict", flags=TEXT_FLAGS)
+            n = 0
+            for block in raw["blocks"]:
+                if block.get("type") != 0:
                     continue
-                cs = rows[rr]
-                shown = "".join(
-                    "#" if c.c.isdigit()
-                    else ("\u00b7" if c.c == " " else "\u21e5") if c.bbox is None
-                    else c.c
-                    for c in cs
-                )
-                boxes = [c.bbox for c in cs if c.bbox is not None]
-                sizes = sorted({round(c.size, 1) for c in cs if c.bbox is not None})
-                x0 = min(b.x0 for b in boxes) if boxes else 0
-                y = cs[0].baseline
-                where = f"x={x0:.0f} y={y:.0f}" if y is not None else "rotated"
-                print(f"  row {rr - r:+d} ({where}, size {sizes}): {shown}")
+                for line in block["lines"]:
+                    for span in line["spans"]:
+                        text = "".join(ch["c"] for ch in span["chars"])
+                        if not text.strip() or not pymupdf.Rect(span["bbox"]).intersects(region):
+                            continue
+                        n += 1
+                        dx, dy = line["dir"]
+                        rot = "" if abs(dy) < 1e-3 and dx > 0 else f" dir=({dx:.2f},{dy:.2f})"
+                        x0, y0 = span["bbox"][:2]
+                        print(f"  x={x0:5.0f} y={y0:5.0f} {span['font']!r} "
+                              f"{span['size']:.1f}pt{rot}: {mask_text(text)}")
+            if n == 0:
+                print("  no text here")
+            images = [i for i in page.get_image_info() if pymupdf.Rect(i["bbox"]).intersects(region)]
+            shapes = [d for d in page.get_drawings() if d["rect"].intersects(region)]
+            print(f"  {len(images)} image(s) and {len(shapes)} drawn shape(s) overlap this area")
     if not found:
         print(f"{args.label!r} not found in the PDF's text. If you can see it on the "
               f"page, that part is an image or drawn shapes, not text.")
+    else:
+        print("\nkey: # digit  \u25a1 control char  \u25c7 private-use char  "
+              "\ufffd unmapped glyph  \u00a4 other non-ASCII")
     return 0
 
 

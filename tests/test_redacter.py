@@ -229,7 +229,13 @@ def test_text_after_redaction_does_not_move(tmp_path):
 
 
 def test_inspect_masks_digits(pdf, capsys):
-    assert main(["inspect", str(pdf), "first name", "--rows", "1"]) == 0
+    assert main(["inspect", str(pdf), "first name"]) == 0
     out = capsys.readouterr().out
-    assert "JANE" in out and "###-##-####" in out
-    assert not any(c.isdigit() for line in out.splitlines()[1:] for c in line.split(":", 1)[1])
+    spans = [line.split("pt: ", 1)[1] for line in out.splitlines() if "pt: " in line]
+    assert "JANE Q" in spans and "###-##-####" in spans
+    assert not any(c.isdigit() for span in spans for c in span)
+
+
+def test_mask_text_hides_unreadable_chars():
+    from redacter.detect import mask_text
+    assert mask_text("A1\x13\ue001\ufffd\u00e9") == "A#\u25a1\u25c7\ufffd\u00a4"

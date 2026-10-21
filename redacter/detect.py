@@ -11,6 +11,7 @@ rectangles to black out.
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass, field
 
 import pymupdf
@@ -218,10 +219,53 @@ def _rects_for(
     return covers, cuts
 
 
+def char_class(c: str) -> str:
+    """'digit', 'ascii', 'space', 'control', 'private', 'unmapped' or 'other'."""
+    if c.isdigit():
+        return "digit"
+    if c.isspace():
+        return "space"
+    if c == "\ufffd":
+        return "unmapped"
+    cat = unicodedata.category(c)
+    if cat == "Cc":
+        return "control"
+    if cat == "Co":
+        return "private"
+    return "ascii" if c.isascii() else "other"
+
+
+_MASK = {"digit": "#", "control": "\u25a1", "private": "\u25c7",
+         "unmapped": "\ufffd", "other": "\u00a4"}
+
+
+def mask_text(text: str) -> str:
+    """Hide digits and anything that might be a digit in a custom encoding."""
+    return "".join(_MASK.get(char_class(c), c) for c in text)
+
+
+UNREADABLE = {"control", "private", "unmapped"}
+
+
 def page_warnings(doc: pymupdf.Document) -> list[str]:
     """Flag pages whose content the text-based detector cannot see."""
     warnings = []
     for pno, page in enumerate(doc):
+        fonts: dict[str, int] = {}
+        raw = page.get_text("rawdict", flags=TEXT_FLAGS)
+        for block in raw["blocks"]:
+            for line in block.get("lines", []):
+                for span in line["spans"]:
+                    bad = sum(char_class(ch["c"]) in UNREADABLE for ch in span["chars"])
+                    if bad:
+                        fonts[span["font"]] = fonts.get(span["font"], 0) + bad
+        if fonts:
+            warnings.append(
+                f"page {pno + 1} has {sum(fonts.values())} character(s) with no "
+                f"readable text mapping (font {', '.join(sorted(fonts))}); numbers "
+                f"in that font can't be detected. Run 'redacter inspect' near them"
+            )
+
         images = page.get_image_info()
         if not images:
             continue

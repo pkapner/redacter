@@ -53,11 +53,13 @@ reads that spot:
 redacter inspect 2025-return.pdf "social security"
 ```
 
-This prints the row with that label plus the rows after it. Digits are
-masked as `#`, so you can share the output without revealing the number.
-A `·` marks a small gap the tool read as a space, and a `⇥` marks a wide
-gap. If the label isn't found at all, that part of the page is an image
-or drawn shapes, so use a `[[boxes]]` entry for it.
+This prints every text span near the label with its font, and counts
+the images and drawn shapes there. Digits show as `#`, and characters
+with no readable text mapping get their own symbols, so you can share the
+output without revealing the number. If the number is missing from the
+list, or shows as unreadable symbols, text search can't find it; use a
+`[[boxes]]` entry for it. `scan` also warns about pages containing
+unreadable characters.
 
 ## What gets redacted
 
