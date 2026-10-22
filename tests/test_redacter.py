@@ -514,3 +514,25 @@ def test_pdf_with_corrupt_object(tmp_path, referenced):
     out = tmp_path / "out.pdf"
     assert main(["apply", str(src), "-o", str(out)]) == 0
     assert SSN not in all_text(out)
+
+
+def test_numeric_term_glued_to_letters(tmp_path):
+    # The state and ZIP run together on CCH forms: "NEW YORK NY10075".
+    src = tmp_path / "in.pdf"
+    doc = pymupdf.open()
+    page = doc.new_page()
+    page.insert_text((50, 80), "refund. NEW YORK NY10075 Foreign country", fontsize=10)
+    page.insert_text((50, 110), "ZIP 10075 and 100750 and 1,007,500.", fontsize=10)
+    doc.save(src)
+    cfg = tmp_path / "c.toml"
+    cfg.write_text('terms = ["10075", "Doe"]\n')
+    found = [m.text for m in find_matches(open_pdf(src), load_config(cfg))]
+    assert found == ["10075", "10075"]          # not inside 100750 or 1,007,500
+
+    out = tmp_path / "out.pdf"
+    assert main(["apply", str(src), "-c", str(cfg), "-o", str(out)]) == 0
+    text = all_text(out)
+    assert "NY10075" not in text and "NEW YORK NY" in text
+    assert "100750" in text and "1,007,500." in text
+    assert not term_regex("Doe").search("Doesn't")
+    assert term_regex("80th Street").search("340 E 80th Street")

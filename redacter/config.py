@@ -94,13 +94,19 @@ def term_regex(term: str) -> re.Pattern:
     Case is ignored, any run of whitespace matches any other, and periods or
     commas after a word are optional, so "Jane Q. Doe" also matches "JANE Q DOE"
     and "Springfield, IL" matches "SPRINGFIELD IL".
+
+    A term must not run into a neighbouring word, so "Doe" skips "Doesn't".
+    An edge that is a digit only has to be clear of other digits, because
+    forms glue values to labels: the ZIP in "NY10075", or "Print340 EAST".
     """
     tokens = [t.rstrip(".,") for t in term.split()]
     tokens = [t for t in tokens if t]
     if not tokens:
         raise ConfigError(f"empty term: {term!r}")
     body = r"[.,]?\s+".join(re.escape(t) for t in tokens)
-    return re.compile(rf"(?<!\w){body}(?!\w)", re.IGNORECASE)
+    start = r"(?<!\d)" if tokens[0][0].isdigit() else r"(?<!\w)"
+    end = r"(?!\d)" if tokens[-1][-1].isdigit() else r"(?!\w)"
+    return re.compile(rf"{start}{body}{end}", re.IGNORECASE)
 
 
 def load_config(path: Path | None) -> Config:
