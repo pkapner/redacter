@@ -40,11 +40,27 @@ def open_pdf(path: Path, password: str | None = None,
             password = getpass.getpass(f"Password for {path.name}: ")
         if not doc.authenticate(password):
             raise PasswordNeeded(f"wrong password for {path.name}")
+    _drop_broken_objects(doc)
     # Flatten form fields and annotations into page content. Filled-in values
     # of fillable forms live in widgets, not page text: without this they are
     # invisible to detection and would survive redaction.
     doc.bake(annots=True, widgets=True)
     return doc
+
+
+def _drop_broken_objects(doc: pymupdf.Document) -> None:
+    """Replace objects the file lists but MuPDF can't load with empty ones.
+
+    Real-world PDFs often have such entries ("cannot find object in xref").
+    Viewers ignore them, but anything that walks every object (including
+    PyMuPDF's scrub) stops with an error. They hold nothing readable, so
+    emptying them changes nothing visible.
+    """
+    for xref in range(1, doc.xref_length()):
+        try:
+            doc.xref_object(xref)
+        except Exception:
+            doc.update_object(xref, "<<>>")  # "null" doesn't replace a broken entry
 
 
 def redact_document(
@@ -123,7 +139,7 @@ def sanitize(doc: pymupdf.Document) -> None:
     for key in CATALOG_STRIP:
         doc.xref_set_key(cat, key, "null")
     doc.xref_set_key(-1, "Info", "null")
-    for xref in range(1, doc.xref_length()):
+    for xref in readable_xrefs(doc):
         if not doc.xref_is_stream(xref) and doc.xref_object(xref).lstrip()[:2] != "<<":
             continue
         # Per-object metadata: XMP on pages, images, fonts; app private data.
@@ -139,6 +155,21 @@ def sanitize(doc: pymupdf.Document) -> None:
     # A fresh file ID: the original's ID would link this copy to the
     # unredacted file it came from.
     doc.xref_set_key(-1, "ID", f"[<{secrets.token_hex(16)}><{secrets.token_hex(16)}>]")
+
+
+def readable_xrefs(doc: pymupdf.Document):
+    """Object numbers MuPDF can actually load.
+
+    Real-world PDFs often list objects in their index that are missing or
+    corrupt ("cannot find object in xref"). Those can't be read, and since
+    the output is rewritten from readable objects only, they never reach it.
+    """
+    for xref in range(1, doc.xref_length()):
+        try:
+            doc.xref_object(xref)
+        except Exception:
+            continue
+        yield xref
 
 
 # Catalog entries that can hold names or text outside the page content.
@@ -328,7 +359,7 @@ def verify(out: Path, cfg: Config, applied: list[Match], skipped: list[Match],
 def _searchable_bytes(doc: pymupdf.Document) -> bytes:
     """The file's objects and non-binary streams, decompressed, lowercased."""
     parts = [doc.pdf_trailer().encode("latin-1", "replace")]
-    for xref in range(1, doc.xref_length()):
+    for xref in readable_xrefs(doc):
         obj = doc.xref_object(xref, compressed=False)
         parts.append(obj.encode("latin-1", "replace"))
         if not doc.xref_is_stream(xref):
@@ -354,7 +385,7 @@ def metadata_leftovers(doc: pymupdf.Document) -> list[str]:
     for key in CATALOG_STRIP:
         if doc.xref_get_key(cat, key)[0] not in ("null",):
             issues.append(f"document catalog still has /{key}")
-    for xref in range(1, doc.xref_length()):
+    for xref in readable_xrefs(doc):
         for key in OBJECT_STRIP:
             if doc.xref_get_key(xref, key)[0] != "null":
                 issues.append(f"object {xref} still has /{key}")

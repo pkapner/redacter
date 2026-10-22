@@ -488,3 +488,29 @@ def test_label_touching_value_in_bigger_font():
     cfg = Config()
     cfg.terms = ["340 East 80th Street"]
     assert [(m.kind, m.text) for m in find_matches(doc, cfg)] == [("term", "340 EAST 80TH STREET")]
+
+
+@pytest.mark.parametrize("referenced", [False, True])
+def test_pdf_with_corrupt_object(tmp_path, referenced):
+    # Real PDFs often list objects that can't be loaded ("cannot find
+    # object in xref"); redaction must carry on regardless.
+    import re
+    doc = pymupdf.open()
+    page = doc.new_page()
+    page.insert_text((50, 80), f"SSN {SSN}", fontsize=11)
+    spare = doc.get_new_xref()
+    doc.update_object(spare, "<</Spare 1>>")
+    if referenced:
+        doc.xref_set_key(page.xref, "Extra", f"{spare} 0 R")
+    good = tmp_path / "good.pdf"
+    doc.save(good, garbage=0, deflate=False)
+    raw = good.read_bytes()
+    assert re.search(rf"\n{spare} 0 obj".encode(), raw)
+    src = tmp_path / "broken.pdf"
+    src.write_bytes(raw.replace(f"\n{spare} 0 obj".encode(), b"\nXX 0 obj", 1))
+    with pytest.raises(Exception):
+        pymupdf.open(src).xref_object(spare)  # really broken
+
+    out = tmp_path / "out.pdf"
+    assert main(["apply", str(src), "-o", str(out)]) == 0
+    assert SSN not in all_text(out)
