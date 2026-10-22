@@ -475,3 +475,16 @@ def test_output_paths_are_unique():
     from redacter.batch import output_paths
     outs = output_paths([Path("/a/x.pdf"), Path("/b/x.pdf"), Path("/c/y.pdf")], Path("/o"))
     assert [p.name for p in outs] == ["x.redacted.pdf", "x.redacted-2.pdf", "y.redacted.pdf"]
+
+
+def test_label_touching_value_in_bigger_font():
+    # CCH's "Type or Print" label sits right against the address it labels.
+    doc = pymupdf.open()
+    page = doc.new_page()
+    page.insert_text((258, 118), "Print", fontsize=6.9, fontname="hebo")
+    w = pymupdf.get_text_length("Print", fontname="hebo", fontsize=6.9)
+    page.insert_text((258 + w + 1.0, 118), "340 EAST 80TH STREET APT 2F",
+                     fontsize=9.8, fontname="cour")
+    cfg = Config()
+    cfg.terms = ["340 East 80th Street"]
+    assert [(m.kind, m.text) for m in find_matches(doc, cfg)] == [("term", "340 EAST 80TH STREET")]

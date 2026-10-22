@@ -123,15 +123,22 @@ def page_text(page: pymupdf.Page) -> PageText:
                 # Read a box divider as a space; leave its outline out of
                 # the match so it does not inflate the black box.
                 out.append(Char(" ", None, r))
-                prev = (" ", bbox)
+                prev = (" ", bbox, size)
                 continue
             if prev is not None and not prev[0].isspace() and not c.isspace():
                 gap = bbox.x0 - prev[1].x1
                 both_digits = prev[0].isdigit() and c.isdigit()
+                size_jump = max(size, prev[2]) > 1.2 * min(size, prev[2])
                 if gap > 3 * size:
                     # Far apart: different form columns. A tab keeps number
                     # patterns (which only allow spaces) from joining them.
                     out.append(Char("\t", None, r))
+                elif size_jump and gap > -0.1 * size:
+                    # A font size change is a label meeting a value, e.g. the
+                    # "Print" of a "Type or Print" label right against an
+                    # address; without a break, "Print340 EAST..." would hide
+                    # the address from terms.
+                    out.append(Char(" ", None, r))
                 elif both_digits:
                     # Digits in comb fields (one box per digit) are evenly
                     # spaced and stay joined. A gap clearly wider than the
@@ -150,7 +157,7 @@ def page_text(page: pymupdf.Page) -> PageText:
                     out.append(Char(" ", None, r))
             baseline = origin[1] if origin is not None else None
             out.append(Char(c.translate(_NORMALIZE), bbox, r, baseline, size))
-            prev = (c, bbox)
+            prev = (c, bbox, size)
 
     return PageText("".join(ch.c for ch in out), out)
 
