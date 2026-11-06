@@ -536,3 +536,39 @@ def test_numeric_term_glued_to_letters(tmp_path):
     assert "100750" in text and "1,007,500." in text
     assert not term_regex("Doe").search("Doesn't")
     assert term_regex("80th Street").search("340 E 80th Street")
+
+
+def test_image_pixels_under_black_box_are_destroyed(tmp_path):
+    # A scanned page: the words are pixels in an image, with a text layer
+    # on top. Deleting the black box from the output must reveal nothing.
+    pix = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, 600, 400), False)
+    pix.set_rect(pix.irect, (200, 200, 200))
+    doc = pymupdf.open()
+    page = doc.new_page(width=600, height=400)
+    page.insert_image(page.rect, pixmap=pix)
+    # tightly spaced lines, so the text-removal band is trimmed thinner
+    # than the black box and only the second pass wipes the box's edges
+    page.insert_text((50, 89.5), "Line above gjpqy 4,500.", fontsize=10)
+    page.insert_text((50, 100), f"SSN {SSN} Wages", fontsize=10)
+    page.insert_text((50, 110.5), "Line below TTTT 7,200.", fontsize=10)
+    src = tmp_path / "in.pdf"
+    doc.save(src)
+
+    out = tmp_path / "out.pdf"
+    assert main(["apply", str(src), "-o", str(out)]) == 0
+    res = pymupdf.open(out)
+    page = res[0]
+    box = next(d["rect"] for d in page.get_drawings() if d.get("fill") == (0.0, 0.0, 0.0))
+    xref = page.get_images()[0][0]
+    img = pymupdf.Pixmap(res, xref)
+    sx, sy = img.width / page.rect.width, img.height / page.rect.height
+    # include the box's top and bottom edges: the text-removal band is
+    # thinner than the box, so those strips are what the old code missed
+    for fx in (0.1, 0.5, 0.9):
+        for y_pt in (box.y0 + 0.6, box.y0 + 0.3 * box.height, box.y1 - 0.6):
+            x = int((box.x0 + fx * box.width) * sx)
+            y = int(y_pt * sy)
+            # MuPDF blanks redacted pixels (to white): anything but the
+            # original grey means the image data under the box is gone
+            assert img.pixel(x, y)[:3] != (200, 200, 200), (fx, y_pt)
+    assert img.pixel(5, 5)[:3] == (200, 200, 200)  # the rest of the image is intact

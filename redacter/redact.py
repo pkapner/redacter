@@ -105,6 +105,18 @@ def redact_document(
             text=pymupdf.PDF_REDACT_TEXT_REMOVE,
         )
         rects = covers.get(page.number)
+        if rects and page.get_images():
+            # The removal bands above are thin, so they only wiped a strip of
+            # any image under the text. On a scanned page the words are in
+            # the image itself: wipe its pixels under every black box too,
+            # or deleting the box would reveal them.
+            for r in sorted(rects):
+                page.add_redact_annot(pymupdf.Rect(r), fill=FILL, cross_out=False)
+            page.apply_redactions(
+                images=pymupdf.PDF_REDACT_IMAGE_PIXELS,
+                graphics=pymupdf.PDF_REDACT_LINE_ART_NONE,
+                text=pymupdf.PDF_REDACT_TEXT_NONE,
+            )
         if rects:  # all black boxes of a page in one drawing
             shape = page.new_shape()
             for r in sorted(rects):
