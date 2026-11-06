@@ -1,6 +1,10 @@
 # redacter config. This file lists your PII: keep it private (mode 600)
 # and out of version control.
 
+# Scanned pages: "auto" reads mostly-image pages with OCR (macOS Vision),
+# "always" reads every page with OCR, "off" never uses it.
+ocr = "auto"
+
 # Exact strings to redact: names, addresses, employer names, dependents.
 # Case is ignored, any whitespace matches any whitespace, and periods/commas
 # after a word are optional ("Jane Q. Doe" also matches "JANE Q DOE").

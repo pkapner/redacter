@@ -12,7 +12,7 @@ from pathlib import Path
 import pymupdf
 
 from .config import Box, Config
-from .detect import Match, Progress, find_matches, page_text, value_regex
+from .detect import Match, Progress, find_matches, read_pages, value_regex
 
 FILL = (0, 0, 0)
 
@@ -319,16 +319,18 @@ def verify(out: Path, cfg: Config, applied: list[Match], skipped: list[Match],
             values.setdefault(key, m.text)
 
     # 1. Detection finds nothing new (other than matches the user kept).
+    #    Scanned pages are read again with OCR: this checks the image itself.
     verify_progress = (lambda w, d, t: step("Verifying: re-reading pages", d, t)) if progress else None
-    for m in find_matches(doc, cfg, verify_progress):
+    texts = read_pages(doc, cfg, verify_progress)
+    for m in find_matches(doc, cfg, texts=texts):
         if _compact(m.text) not in skipped_texts:
             leaks[f"page {m.page + 1}: {m.kind} still detected: {m.text!r}"] = None
 
     # 2. No redacted value survives anywhere in the extracted text, in any
-    #    formatting (same digit boundaries as detection, so 10075 is not
-    #    reported inside an amount like 1,007,500).
+    #    formatting (same digit boundaries as detection, so 12345 is not
+    #    reported inside an amount like 1,234,500).
     step("Verifying: searching text")
-    pages = [page_text(p).text for p in doc]
+    pages = [t.text for t in texts]
     for text_value in values.values():
         rx = value_regex(text_value)
         if rx is None:

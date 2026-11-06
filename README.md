@@ -129,11 +129,27 @@ optional, so `"Jane Q. Doe"` also matches `JANE Q DOE`. A term only matches
 the words it contains, in that order: list `"Doe, Jane"` and `"Doe"` on
 their own if those forms appear.
 
+## Scanned pages
+
+A scanned page is a picture of text, usually with an invisible text layer
+added by the scanner's OCR. That layer's word positions are often off, so
+boxes placed from it would miss the words you can see. On a Mac, Redacter
+reads such pages itself with Apple's Vision OCR (the engine behind Live
+Text, entirely on your computer) and places each box from the pixels. It
+wipes the image under every box and drops the old invisible layer.
+Verification reads the redacted page again with OCR to confirm the
+matches are gone from the image.
+
+Pages count as scanned when they're mostly image and their text, if any,
+is invisible. Set `ocr = "always"` (or **Settings → Scanned pages** in the
+app) to OCR every page, or `"off"` to never use it. Without Vision (not on
+a Mac), scanned pages fall back to their text layer, with a warning.
+
 ## What else it does
 
 - **Redacts every copy.** A number found anywhere, such as a phone number,
   is also removed everywhere else it appears, whatever its formatting
-  (`212-472-5638`, `(212) 472 5638`, `no.2124725638`).
+  (`212-555-0142`, `(212) 555 0142`, `no.2125550142`).
 - **Flattens fillable forms first.** Values typed into fillable form fields
   aren't page text, so they'd be missed without this.
 - **Strips hidden places:** document info and XMP metadata (on the document
@@ -151,9 +167,10 @@ their own if those forms appear.
 
 ## Limitations
 
-- **Text-based PDFs only.** Scanned pages and images aren't OCR'd. The tool
-  warns about pages with images, which you must check by eye; use `[[boxes]]`
-  to black them out.
+- **Scanned pages need a Mac for OCR,** and OCR can misread. Check scanned
+  pages' redactions by eye. Images inside otherwise-digital pages (a logo, a
+  signature) aren't read; look at them yourself, and use **Draw box** or
+  `[[boxes]]` for anything personal.
 - **Names and addresses come only from your `terms` list.** There's no
   ML-based name detection, so check the scan output for anything missing.
 - **Over-redaction is possible:** any 9-digit or long number is treated as

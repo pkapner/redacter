@@ -22,7 +22,7 @@ from PySide6.QtGui import (
     QKeySequence, QPainter, QPen,
 )
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QCheckBox, QFileDialog, QFrame, QGridLayout,
+    QAbstractItemView, QApplication, QCheckBox, QComboBox, QFileDialog, QFrame, QGridLayout,
     QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QListWidget,
     QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressDialog, QPushButton, QScrollArea,
     QSizePolicy, QSplitter, QStackedWidget, QStatusBar, QTabWidget, QToolBar, QTreeWidget,
@@ -31,7 +31,8 @@ from PySide6.QtWidgets import (
 
 from .config import BUILTIN_PATTERNS, Box, Config, ConfigError, load_config, save_config
 from .batch import BatchJob, output_paths, run_batch
-from .detect import Match, find_matches, match_key, page_text, page_warnings
+from . import ocr
+from .detect import Match, PageText, find_matches, match_key, page_text, page_warnings, read_pages
 from .redact import PasswordNeeded, RedactError, open_pdf, redact_file, write_review_pdf
 
 PATTERN_HELP = {
@@ -64,6 +65,7 @@ class FileEntry:
     matches: list[Match] | None = None
     scanned_version: int = -1     # settings version the matches came from
     warnings: list[str] = field(default_factory=list)
+    texts: list[PageText] | None = None  # page text as read (incl. OCR)
     kept_keys: set[tuple] = field(default_factory=set)
     boxes: list[Box] = field(default_factory=list)
     page_no: int = 0
@@ -548,6 +550,21 @@ class MainWindow(QMainWindow):
         self.allow_edit.setMaximumHeight(70)
         lay.addWidget(self.allow_edit)
 
+        ocr_row = QHBoxLayout()
+        ocr_row.addWidget(QLabel("<b>Scanned pages</b>"))
+        self.ocr_combo = QComboBox()
+        for mode, label in [("auto", "Read with OCR (automatic)"),
+                            ("always", "Read every page with OCR"),
+                            ("off", "Don't use OCR")]:
+            self.ocr_combo.addItem(label, mode)
+        self.ocr_combo.setToolTip(
+            "Scanned pages are pictures of text. OCR reads the picture itself, so\n"
+            "redaction boxes land on the visible words. Automatic uses it on pages\n"
+            "that are mostly image." + ("" if ocr.engine() else
+                                        "\n\nOCR isn't available on this computer."))
+        ocr_row.addWidget(self.ocr_combo, 1)
+        lay.addLayout(ocr_row)
+
         lay.addWidget(QLabel("<b>Detectors</b>"))
         grid = QGridLayout()
         self.pattern_boxes: dict[str, QCheckBox] = {}
@@ -599,6 +616,7 @@ class MainWindow(QMainWindow):
         self.allow_edit.setPlainText("\n".join(self.cfg.allow))
         for name, cb in self.pattern_boxes.items():
             cb.setChecked(self.cfg.patterns.get(name, False))
+        self.ocr_combo.setCurrentIndex(max(0, self.ocr_combo.findData(self.cfg.ocr)))
         self.custom_edit.setPlainText("\n".join(f"{k} = {v}" for k, v in self.cfg.custom.items()))
 
     def _form_to_config(self) -> Config:
@@ -606,6 +624,7 @@ class MainWindow(QMainWindow):
         cfg.terms = [t.strip() for t in self.terms_edit.toPlainText().splitlines() if t.strip()]
         cfg.allow = [a.strip() for a in self.allow_edit.toPlainText().splitlines() if a.strip()]
         cfg.patterns = {name: cb.isChecked() for name, cb in self.pattern_boxes.items()}
+        cfg.ocr = self.ocr_combo.currentData() or "auto"
         for n, line in enumerate(self.custom_edit.toPlainText().splitlines(), 1):
             if not line.strip():
                 continue
@@ -741,7 +760,7 @@ class MainWindow(QMainWindow):
         self.stack.setCurrentIndex(1)
         self._select_row(index)
         if entry.matches is not None and entry.scanned_version == self.cfg_version:
-            self._scan_done((entry.matches, list(entry.warnings)))
+            self._scan_done((entry.matches, list(entry.warnings), entry.texts))
         else:
             self.rescan()
         return True
@@ -825,17 +844,19 @@ class MainWindow(QMainWindow):
         doc, cfg = self.doc, self.cfg
 
         def work(progress):
-            matches = find_matches(doc, cfg, progress)
-            progress("Checking pages for images", 0, 1)
-            return matches, page_warnings(doc)
+            texts = read_pages(doc, cfg, progress)
+            matches = find_matches(doc, cfg, texts=texts)
+            progress("Checking pages", 0, 1)
+            return matches, page_warnings(doc, cfg), texts
 
         self.run_task("Scanning", work, self._scan_done)
 
     def _scan_done(self, result):
-        self.matches, warnings = result
+        self.matches, warnings, self.page_texts = result
         if self.current is not None:
             entry = self.entries[self.current]
             entry.matches, entry.warnings = self.matches, list(warnings)
+            entry.texts = self.page_texts
             entry.scanned_version = self.cfg_version
             if entry.output is None and not entry.failed:
                 entry.status = f"{len(self.matches)} matches"
@@ -984,7 +1005,9 @@ class MainWindow(QMainWindow):
         self._refresh_page()
 
     def add_term_from_region(self, rect: pymupdf.Rect):
-        pt = page_text(self.doc[self.page_no])
+        texts = getattr(self, "page_texts", None)
+        # on scanned pages, select from what OCR read, not the text layer
+        pt = texts[self.page_no] if texts else page_text(self.doc[self.page_no])
         inside = {i for i, ch in enumerate(pt.chars)
                   if ch.bbox is not None and rect.contains((ch.bbox.tl + ch.bbox.br) / 2)}
         picked = ""

@@ -242,7 +242,7 @@ def _print_table(matches, skip: set[int], mask: bool = False) -> None:
 
 
 def _print_warnings(doc, cfg) -> None:
-    for w in page_warnings(doc):
+    for w in page_warnings(doc, cfg):
         print(f"warning: {w}", file=sys.stderr)
     if not cfg.terms:
         print("warning: no 'terms' configured, so names and addresses will NOT be "

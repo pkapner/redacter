@@ -73,6 +73,7 @@ class Config:
     patterns: dict[str, bool] = field(default_factory=lambda: dict(DEFAULT_ENABLED))
     custom: dict[str, str] = field(default_factory=dict)
     boxes: list[Box] = field(default_factory=list)
+    ocr: str = "auto"  # scanned pages: "auto" (mostly-image pages), "always", "off"
 
     def compiled_patterns(self) -> list[tuple[str, re.Pattern, Callable | None]]:
         """Return (kind, regex, filter) in matching order: terms, custom, built-ins."""
@@ -97,7 +98,7 @@ def term_regex(term: str) -> re.Pattern:
 
     A term must not run into a neighbouring word, so "Doe" skips "Doesn't".
     An edge that is a digit only has to be clear of other digits, because
-    forms glue values to labels: the ZIP in "NY10075", or "Print340 EAST".
+    forms glue values to labels: the ZIP in "NY12345", or "Print100 EAST".
     """
     tokens = [t.rstrip(".,") for t in term.split()]
     tokens = [t for t in tokens if t]
@@ -120,13 +121,16 @@ def load_config(path: Path | None) -> Config:
     except tomllib.TOMLDecodeError as e:
         raise ConfigError(f"{path}: {e}")
 
-    known = {"terms", "allow", "patterns", "custom", "boxes"}
+    known = {"terms", "allow", "patterns", "custom", "boxes", "ocr"}
     unknown = set(data) - known
     if unknown:
         raise ConfigError(f"{path}: unknown keys: {', '.join(sorted(unknown))}")
 
     cfg = Config()
     cfg.terms = _str_list(data, "terms", path)
+    cfg.ocr = data.get("ocr", "auto")
+    if cfg.ocr not in ("auto", "always", "off"):
+        raise ConfigError(f'{path}: ocr must be "auto", "always" or "off"')
     cfg.allow = _str_list(data, "allow", path)
 
     for name, enabled in data.get("patterns", {}).items():
@@ -184,6 +188,9 @@ def dump_config(cfg: Config) -> str:
     lines = [
         "# redacter config. This file lists your PII: keep it private",
         "# and out of version control.",
+        "",
+        "# OCR for scanned pages: \"auto\" (mostly-image pages), \"always\", \"off\"",
+        f"ocr = {_toml_str(cfg.ocr)}",
         "",
         "terms = [",
         *(f"    {_toml_str(t)}," for t in cfg.terms),

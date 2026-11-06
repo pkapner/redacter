@@ -135,3 +135,26 @@ def test_multiple_files_keep_their_own_choices_and_batch(win, tmp_path):
     assert all(SSN not in all_text(p) for p in outs)
     assert all(e.output is not None and not e.failed for e in win.entries)
     assert len(win.result_file.paths) == 3
+
+
+def test_scanned_page_in_app_uses_ocr(win, tmp_path, monkeypatch):
+    from redacter import ocr
+    from test_ocr import fake_engine, make_scan, true_rect
+
+    path = tmp_path / "scan.pdf"
+    truth, rect = make_scan(path)
+    ocr.set_engine(fake_engine(truth, rect))
+    try:
+        win.load_pdf(path)
+        win.wait_idle()
+        assert any(m.text == "123-45-6789" for m in win.matches)
+        assert any("read with OCR" in win.warnings.item(i).text()
+                   for i in range(win.warnings.count()))
+        # "Add term" on a scanned page offers what OCR read there
+        offered = []
+        monkeypatch.setattr(QtWidgets.QInputDialog, "getText",
+                            lambda *a, **k: (offered.append(a[4]), ("", False))[1])
+        win.add_term_from_region(true_rect(truth, "Premium before") + (-2, -2, 2, 2))
+        assert offered == ["Premium before"]
+    finally:
+        ocr.set_engine(None)

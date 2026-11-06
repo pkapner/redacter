@@ -264,8 +264,8 @@ def make_zero_width_font_pdf(path: Path) -> Path:
         glyphs = " ".join(f"({c}) -600" for c in s)
         return f"BT /ZW 10 Tf {x} {y} Td [{glyphs}] TJ ET "
 
-    body = (show(50, 720, "031176110") + show(130, 720, "36057570935")
-            + show(50, 690, "123 45 6789") + show(50, 670, "LILY KAPNER")
+    body = (show(50, 720, "120000123") + show(130, 720, "98765432101")
+            + show(50, 690, "123 45 6789") + show(50, 670, "JANE ROE")
             + show(50, 650, "Keep this"))
     contents = doc.get_new_xref()
     doc.update_object(contents, "<<>>")
@@ -278,7 +278,7 @@ def make_zero_width_font_pdf(path: Path) -> Path:
 def test_zero_width_font_glyphs(tmp_path):
     src = make_zero_width_font_pdf(tmp_path / "in.pdf")
     cfg = tmp_path / "c.toml"
-    cfg.write_text('terms = ["Lily Kapner"]\n')
+    cfg.write_text('terms = ["Jane Roe"]\n')
     kinds = {m.kind for m in find_matches(open_pdf(src), load_config(cfg))}
     assert kinds == {"nine_digit", "account_number", "ssn", "term"}
 
@@ -286,7 +286,7 @@ def test_zero_width_font_glyphs(tmp_path):
     assert main(["apply", str(src), "-c", str(cfg), "-o", str(out)]) == 0
     text = "".join(all_text(out).split())  # default extraction spaces every glyph
     assert "Keepthis" in text
-    for secret in ["031176110", "36057570935", "6789", "KAPNER"]:
+    for secret in ["120000123", "98765432101", "6789", "ROE"]:
         assert secret not in text
 
 
@@ -360,21 +360,21 @@ def test_value_found_once_is_redacted_everywhere(tmp_path):
     src = tmp_path / "in.pdf"
     doc = pymupdf.open()
     page = doc.new_page()
-    page.insert_text((50, 100), "Preparer phone 212-472-5638", fontsize=10)
-    page.insert_text((50, 130), "Designee Phone no.2124725638 PIN 4", fontsize=10)
-    page.insert_text((50, 160), "Office (212) 472 5638", fontsize=10)
-    page.insert_text((50, 190), "New York, NY 10075  Total 1,007,500. Rate 0.1234567890", fontsize=10)
-    page.insert_text((50, 220), "Second page header NY10075", fontsize=10)
+    page.insert_text((50, 100), "Preparer phone 212-555-0142", fontsize=10)
+    page.insert_text((50, 130), "Designee Phone no.2125550142 PIN 4", fontsize=10)
+    page.insert_text((50, 160), "Office (212) 555 0142", fontsize=10)
+    page.insert_text((50, 190), "New York, NY 12345  Total 1,234,500. Rate 0.9876543210", fontsize=10)
+    page.insert_text((50, 220), "Second page header NY12345", fontsize=10)
     doc.save(src)
     cfg = tmp_path / "c.toml"
-    cfg.write_text("[custom]\nzip = '(?<!\\d)10075(?:-?\\d{4})?(?!\\d)'\n")
+    cfg.write_text("[custom]\nzip = '(?<!\\d)12345(?:-?\\d{4})?(?!\\d)'\n")
 
     out = tmp_path / "out.pdf"
     assert main(["apply", str(src), "-c", str(cfg), "-o", str(out)]) == 0
     text = all_text(out)
-    for gone in ["5638", "2124725638", "10075"]:
-        assert gone not in text.replace(",", "").replace("1007500", ""), gone
-    for kept in ["Preparer phone", "Phone no.", "1,007,500.", "0.1234567890"]:
+    for gone in ["0142", "2125550142", "12345"]:
+        assert gone not in text.replace(",", "").replace("1234500", ""), gone
+    for kept in ["Preparer phone", "Phone no.", "1,234,500.", "0.9876543210"]:
         assert kept in text, kept
 
 
@@ -483,11 +483,11 @@ def test_label_touching_value_in_bigger_font():
     page = doc.new_page()
     page.insert_text((258, 118), "Print", fontsize=6.9, fontname="hebo")
     w = pymupdf.get_text_length("Print", fontname="hebo", fontsize=6.9)
-    page.insert_text((258 + w + 1.0, 118), "340 EAST 80TH STREET APT 2F",
+    page.insert_text((258 + w + 1.0, 118), "100 EAST 5TH STREET APT 4B",
                      fontsize=9.8, fontname="cour")
     cfg = Config()
-    cfg.terms = ["340 East 80th Street"]
-    assert [(m.kind, m.text) for m in find_matches(doc, cfg)] == [("term", "340 EAST 80TH STREET")]
+    cfg.terms = ["100 East 5th Street"]
+    assert [(m.kind, m.text) for m in find_matches(doc, cfg)] == [("term", "100 EAST 5TH STREET")]
 
 
 @pytest.mark.parametrize("referenced", [False, True])
@@ -517,25 +517,25 @@ def test_pdf_with_corrupt_object(tmp_path, referenced):
 
 
 def test_numeric_term_glued_to_letters(tmp_path):
-    # The state and ZIP run together on CCH forms: "NEW YORK NY10075".
+    # The state and ZIP run together on CCH forms: "NEW YORK NY12345".
     src = tmp_path / "in.pdf"
     doc = pymupdf.open()
     page = doc.new_page()
-    page.insert_text((50, 80), "refund. NEW YORK NY10075 Foreign country", fontsize=10)
-    page.insert_text((50, 110), "ZIP 10075 and 100750 and 1,007,500.", fontsize=10)
+    page.insert_text((50, 80), "refund. NEW YORK NY12345 Foreign country", fontsize=10)
+    page.insert_text((50, 110), "ZIP 12345 and 123450 and 1,234,500.", fontsize=10)
     doc.save(src)
     cfg = tmp_path / "c.toml"
-    cfg.write_text('terms = ["10075", "Doe"]\n')
+    cfg.write_text('terms = ["12345", "Doe"]\n')
     found = [m.text for m in find_matches(open_pdf(src), load_config(cfg))]
-    assert found == ["10075", "10075"]          # not inside 100750 or 1,007,500
+    assert found == ["12345", "12345"]          # not inside 123450 or 1,234,500
 
     out = tmp_path / "out.pdf"
     assert main(["apply", str(src), "-c", str(cfg), "-o", str(out)]) == 0
     text = all_text(out)
-    assert "NY10075" not in text and "NEW YORK NY" in text
-    assert "100750" in text and "1,007,500." in text
+    assert "NY12345" not in text and "NEW YORK NY" in text
+    assert "123450" in text and "1,234,500." in text
     assert not term_regex("Doe").search("Doesn't")
-    assert term_regex("80th Street").search("340 E 80th Street")
+    assert term_regex("5th Street").search("100 E 5th Street")
 
 
 def test_image_pixels_under_black_box_are_destroyed(tmp_path):

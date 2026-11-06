@@ -10,7 +10,11 @@ readme = "README.md"
 requires-python = ">=3.11"
 # PyMuPDF 2.0 mis-spaces the text that follows a redaction (it shifts left
 # by one glyph), so stay on 1.x until that is fixed.
-dependencies = ["pymupdf>=1.24.10,<2"]
+dependencies = [
+    "pymupdf>=1.24.10,<2",
+    # OCR for scanned pages uses Apple's Vision framework through PyObjC
+    "pyobjc-framework-Vision>=10; sys_platform == 'darwin'",
+]
 
 [project.optional-dependencies]
 gui = ["PySide6>=6.6"]

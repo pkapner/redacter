@@ -61,6 +61,7 @@ class Match:
 class PageText:
     text: str
     chars: list[Char]
+    ocr: bool = False  # read from the page image rather than its text layer
 
 
 def page_text(page: pymupdf.Page) -> PageText:
@@ -136,7 +137,7 @@ def page_text(page: pymupdf.Page) -> PageText:
                 elif size_jump and gap > -0.1 * size:
                     # A font size change is a label meeting a value, e.g. the
                     # "Print" of a "Type or Print" label right against an
-                    # address; without a break, "Print340 EAST..." would hide
+                    # address; without a break, "Print100 EAST..." would hide
                     # the address from terms.
                     out.append(Char(" ", None, r))
                 elif both_digits:
@@ -221,7 +222,7 @@ def value_regex(text: str) -> re.Pattern | None:
     """Regex for other copies of an already-found value, in any formatting.
 
     A number matches with any spaces, dashes or parentheses between its
-    digits (212-472-5638 also finds 2124725638 and (212) 472 5638), but not
+    digits (212-555-0142 also finds 2125550142 and (212) 555 0142), but not
     inside a longer number or an amount. Other values match as terms do.
     """
     if re.fullmatch(r"[\d\s\-()]+", text):
@@ -238,15 +239,62 @@ def value_regex(text: str) -> re.Pattern | None:
 Progress = Callable[[str, int, int], None]  # (what, done, total)
 
 
-def find_matches(doc: pymupdf.Document, cfg: Config,
-                 progress: Progress | None = None) -> list[Match]:
-    patterns = cfg.compiled_patterns()
-    allowed = {_norm(a) for a in cfg.allow}
+def ocr_page_text(page: pymupdf.Page, lines: list) -> PageText:
+    """PageText from OCR lines (see ocr.py) of a page rendered upright."""
+    view = page.rect  # the page as displayed, i.e. with its rotation
+    to_page = page.derotation_matrix
+    rows = []
+    for line in lines:
+        boxes = [b for _c, b in line if b is not None]
+        if boxes:
+            rows.append((min(b[1] for b in boxes), min(b[0] for b in boxes), line))
+    rows.sort(key=lambda r: (round(r[0], 3), r[1]))
+
+    out: list[Char] = []
+    for r, (_top, _left, line) in enumerate(rows):
+        if out:
+            out.append(Char("\n", None, r))
+        heights = [(b[3] - b[1]) * view.height for _c, b in line if b is not None]
+        size = max(heights) if heights else 0.0
+        for c, b in line:
+            if b is None or c.isspace():
+                out.append(Char(" " if c.isspace() else c, None, r))
+                continue
+            rect = pymupdf.Rect(view.x0 + b[0] * view.width, view.y0 + b[1] * view.height,
+                                view.x0 + b[2] * view.width, view.y0 + b[3] * view.height)
+            rect = rect * to_page
+            rect.normalize()
+            # baseline None: OCR boxes are drawn and removed as they are
+            out.append(Char(c.translate(_NORMALIZE), rect, r, None, size))
+    return PageText("".join(ch.c for ch in out), out, ocr=True)
+
+
+def read_pages(doc: pymupdf.Document, cfg: Config,
+               progress: Progress | None = None) -> list[PageText]:
+    """Text of every page: from the text layer, or by OCR for scanned pages."""
+    from . import ocr
+
+    engine = ocr.engine()
     texts = []
     for pno, page in enumerate(doc):
-        if progress:
-            progress("Reading pages", pno, doc.page_count)
-        texts.append(page_text(page))
+        if engine is not None and ocr.wants_ocr(page, cfg.ocr):
+            if progress:
+                progress("Reading pages (OCR on scanned pages)", pno, doc.page_count)
+            texts.append(ocr_page_text(page, engine(ocr.render_png(page))))
+        else:
+            if progress:
+                progress("Reading pages", pno, doc.page_count)
+            texts.append(page_text(page))
+    return texts
+
+
+def find_matches(doc: pymupdf.Document, cfg: Config,
+                 progress: Progress | None = None,
+                 texts: list[PageText] | None = None) -> list[Match]:
+    patterns = cfg.compiled_patterns()
+    allowed = {_norm(a) for a in cfg.allow}
+    if texts is None:
+        texts = read_pages(doc, cfg, progress)
 
     # First pass: every pattern on every page.
     found: list[list[tuple[int, int, str]]] = []
@@ -259,8 +307,8 @@ def find_matches(doc: pymupdf.Document, cfg: Config,
         found.append(spans)
 
     # Second pass: a value found anywhere is redacted everywhere, however it
-    # is formatted there (a phone number found as 212-472-5638 on one line
-    # is also removed where it appears as "no.2124725638").
+    # is formatted there (a phone number found as 212-555-0142 on one line
+    # is also removed where it appears as "no.2125550142").
     repeats: dict[str, tuple[re.Pattern, str]] = {}
     for pt, spans in zip(texts, found):
         for start, end, kind in spans:
@@ -297,6 +345,11 @@ def find_matches(doc: pymupdf.Document, cfg: Config,
             if _norm(text) in allowed:
                 continue
             rects, cut_rects = _rects_for(pt.chars[start:end], index)
+            if pt.ocr:
+                # OCR boxes hug the glyphs approximately: pad them, and wipe
+                # (image pixels and any old text layer) everything covered.
+                rects = [r + (-1.5, -0.2 * r.height, 1.5, 0.2 * r.height) for r in rects]
+                cut_rects = [pymupdf.Rect(r) for r in rects]
             if not rects:
                 # Never drop a match silently: it would be neither shown nor
                 # redacted. Degenerate boxes are rebuilt upstream, so this is a bug.
@@ -416,10 +469,24 @@ def mask_text(text: str) -> str:
 UNREADABLE = {"control", "private", "unmapped"}
 
 
-def page_warnings(doc: pymupdf.Document) -> list[str]:
+def page_warnings(doc: pymupdf.Document, cfg: Config | None = None) -> list[str]:
     """Flag pages whose content the text-based detector cannot see."""
+    from . import ocr
+
+    mode = cfg.ocr if cfg is not None else "auto"
     warnings = []
     for pno, page in enumerate(doc):
+        if ocr.page_is_scanned(page):
+            if ocr.engine() is not None and ocr.wants_ocr(page, mode):
+                warnings.append(
+                    f"page {pno + 1} is scanned and was read with OCR; check its "
+                    f"redactions by eye, OCR can misread")
+            else:
+                why = "OCR is off in settings" if mode == "off" else "OCR isn't available here"
+                warnings.append(
+                    f"page {pno + 1} is scanned and {why}: only its text layer, if "
+                    f"any, was checked, and its positions may not match the image")
+            continue
         fonts: dict[str, int] = {}
         raw = page.get_text("rawdict", flags=TEXT_FLAGS)
         for block in raw["blocks"]:

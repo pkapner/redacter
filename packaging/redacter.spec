@@ -10,7 +10,8 @@ a = Analysis(
     [os.path.join(SPECPATH, "launch.py")],
     pathex=[REPO],
     datas=[(os.path.join(REPO, "redacter", "redact.example.toml"), "redacter")],
-    hiddenimports=collect_submodules("pymupdf") + ["redacter.gui", "redacter.batch"],
+    hiddenimports=collect_submodules("pymupdf") + ["redacter.gui", "redacter.batch", "redacter.ocr"]
+    + (["objc", "Foundation", "Quartz", "Vision"] if sys.platform == "darwin" else []),
     # Only QtCore/QtGui/QtWidgets are used; keep the rest of Qt out.
     excludes=["tkinter", "PySide6.QtWebEngineCore", "PySide6.QtWebEngineWidgets",
               "PySide6.QtQml", "PySide6.QtQuick", "PySide6.Qt3DCore",
