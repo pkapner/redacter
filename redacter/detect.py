@@ -288,6 +288,16 @@ def read_pages(doc: pymupdf.Document, cfg: Config,
     return texts
 
 
+def read_page(page: pymupdf.Page, cfg: Config) -> PageText:
+    """Text of one page, as read_pages reads it (e.g. again after turning it)."""
+    from . import ocr
+
+    engine = ocr.engine()
+    if engine is not None and ocr.wants_ocr(page, cfg.ocr):
+        return ocr_page_text(page, engine(ocr.render_png(page)))
+    return page_text(page)
+
+
 def find_matches(doc: pymupdf.Document, cfg: Config,
                  progress: Progress | None = None,
                  texts: list[PageText] | None = None) -> list[Match]:

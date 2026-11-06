@@ -26,6 +26,7 @@ class BatchJob:
     password: str | None = None
     kept_keys: set[tuple] = field(default_factory=set)
     boxes: list[Box] = field(default_factory=list)
+    rotations: dict[int, int] = field(default_factory=dict)  # see rotate_pages
 
 
 @dataclass
@@ -54,12 +55,12 @@ def redact_one(job: BatchJob, cfg: Config, progress_queue=None) -> BatchResult:
             progress_queue.put((job.index, what, done, total))
 
     try:
-        doc = open_pdf(job.src, job.password, prompt=False)
+        doc = open_pdf(job.src, job.password, prompt=False, rotations=job.rotations)
         matches = find_matches(doc, cfg, progress)
         doc.close()
         kept = {m.id for m in matches if match_key(m) in job.kept_keys}
         res = redact_file(job.src, job.out, cfg, matches, kept, job.boxes,
-                          job.password, progress)
+                          job.password, progress, job.rotations)
     except Exception as e:  # reported per file; the batch carries on
         return BatchResult(job.index, job.out, error=str(e) or type(e).__name__)
     return BatchResult(job.index, job.out, len(matches), len(res.applied),

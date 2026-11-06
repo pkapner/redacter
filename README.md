@@ -49,6 +49,11 @@ time: right-click the app, choose **Open**, then confirm.
      can't see, like a signature image. Right-click a box to remove it.
    - **Add term:** drag across text, such as a name, to redact it
      everywhere. It's saved to your settings.
+   - **↺ / ↻** (⌘L / ⌘R) turn the current page, e.g. a sideways scan.
+     The redacted PDF keeps the turn, and a scanned page is read again
+     with OCR the right way up.
+   - **Continuous:** show every page in one scroll instead of one at a
+     time.
    - **Settings tab:** edit your terms, exceptions, detectors and custom
      patterns.
 3. **Save review PDF…** (optional) writes one unredacted copy with every

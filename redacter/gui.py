@@ -11,6 +11,7 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 import pymupdf
 from PySide6.QtCore import (
@@ -32,7 +33,9 @@ from PySide6.QtWidgets import (
 from .config import BUILTIN_PATTERNS, Box, Config, ConfigError, load_config, save_config
 from .batch import BatchJob, output_paths, run_batch
 from . import ocr
-from .detect import Match, PageText, find_matches, match_key, page_text, page_warnings, read_pages
+from .detect import (
+    Match, PageText, find_matches, match_key, page_text, page_warnings, read_page, read_pages,
+)
 from .redact import PasswordNeeded, RedactError, open_pdf, redact_file, write_review_pdf
 
 PATTERN_HELP = {
@@ -49,6 +52,7 @@ PATTERN_HELP = {
 RED = QColor(220, 30, 30)
 GREEN = QColor(20, 150, 60)
 BLUE = QColor(40, 90, 230)
+PAGE_GAP = 12  # px around and between pages
 
 
 def default_config_path() -> Path:
@@ -68,6 +72,7 @@ class FileEntry:
     texts: list[PageText] | None = None  # page text as read (incl. OCR)
     kept_keys: set[tuple] = field(default_factory=set)
     boxes: list[Box] = field(default_factory=list)
+    rotations: dict[int, int] = field(default_factory=dict)  # page -> degrees turned
     page_no: int = 0
     output: Path | None = None
     status: str = "not scanned"
@@ -79,17 +84,25 @@ class FileEntry:
 
 
 class PageView(QWidget):
-    """One rendered page with redaction overlays and mouse tools."""
+    """One page with redaction overlays and mouse tools.
 
+    The page image is rendered when the view is first painted, so a long
+    document in continuous scroll only renders the pages scrolled to.
+    """
+
+    pressed = Signal(int)               # page number; precedes the signals below
     matchClicked = Signal(int)          # match id
     boxDrawn = Signal(object)           # pymupdf.Rect, unrotated page coords
     boxRemoveRequested = Signal(int)    # index into self.boxes
     termRegionSelected = Signal(object)  # pymupdf.Rect, unrotated page coords
 
-    def __init__(self):
+    def __init__(self, page_no: int = 0):
         super().__init__()
         self.setMouseTracking(True)
+        self.page_no = page_no
         self.page: pymupdf.Page | None = None
+        # False while a worker uses PyMuPDF (not safe from two threads)
+        self.can_render: Callable[[], bool] = lambda: True
         self.zoom = 1.25
         self.image: QImage | None = None
         self.matches: list[Match] = []
@@ -110,19 +123,22 @@ class PageView(QWidget):
         self.render()
 
     def render(self):
+        """Size to the page at the current zoom; the image follows on paint."""
+        self.image = None
         if self.page is None:
-            self.image = None
             self.setFixedSize(QSize(0, 0))
-            self.update()
-            return
+        else:
+            r = self.page.rect  # as displayed, i.e. with its rotation
+            self.setFixedSize(QSize(round(r.width * self.zoom), round(r.height * self.zoom)))
+        self.update()
+
+    def _render_image(self):
         dpr = self.devicePixelRatioF() or 1.0
         z = self.zoom * dpr
         pix = self.page.get_pixmap(matrix=pymupdf.Matrix(z, z), alpha=False)
         img = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format_RGB888).copy()
         img.setDevicePixelRatio(dpr)
         self.image = img
-        self.setFixedSize(QSize(round(pix.width / dpr), round(pix.height / dpr)))
-        self.update()
 
     def to_view(self, r: pymupdf.Rect) -> QRectF:
         d = r * self.page.rotation_matrix
@@ -154,9 +170,14 @@ class PageView(QWidget):
     # painting ------------------------------------------------------------
 
     def paintEvent(self, _event):
-        if self.image is None:
+        if self.page is None:
             return
         p = QPainter(self)
+        if self.image is None and self.can_render():
+            self._render_image()
+        if self.image is None:  # repainted once the worker is done
+            p.fillRect(self.rect(), Qt.white)
+            return
         p.drawImage(0, 0, self.image)
         if not self.overlays:
             return
@@ -190,6 +211,7 @@ class PageView(QWidget):
     def mousePressEvent(self, e):
         if self.page is None or not self.overlays:
             return
+        self.pressed.emit(self.page_no)
         if e.button() == Qt.RightButton:
             idx = self._box_at(e.position().toPoint())
             if idx is not None:
@@ -353,6 +375,12 @@ class MainWindow(QMainWindow):
         self.boxes: list[Box] = []
         self.page_no = 0
         self.showing_output = False
+        self.views: list[PageView] = []   # one per page of the shown document
+        self._shown_doc: pymupdf.Document | None = None
+        self.zoom = 1.25
+        self.mode = "select"
+        self.highlight: int | None = None
+        self.continuous = self.settings.value("continuous", False, type=bool)
         self.worker: Worker | None = None
         self.progress_dialog: QProgressDialog | None = None
 
@@ -402,6 +430,19 @@ class MainWindow(QMainWindow):
                                    toolTip="Zoom in", triggered=lambda: self.set_zoom(1.25))
         tb.addAction(self.act_zoom_out)
         tb.addAction(self.act_zoom_in)
+        self.act_rotate_left = QAction("↺", self, shortcut=QKeySequence("Ctrl+L"),
+                                       toolTip="Rotate page left (⌘L)",
+                                       triggered=lambda: self.rotate_page(-90))
+        self.act_rotate_right = QAction("↻", self, shortcut=QKeySequence("Ctrl+R"),
+                                        toolTip="Rotate page right (⌘R)",
+                                        triggered=lambda: self.rotate_page(90))
+        tb.addAction(self.act_rotate_left)
+        tb.addAction(self.act_rotate_right)
+        self.act_continuous = QAction("Continuous", self, checkable=True,
+                                      checked=self.continuous,
+                                      toolTip="Show all pages in one continuous scroll",
+                                      triggered=self.set_continuous)
+        tb.addAction(self.act_continuous)
         tb.addSeparator()
 
         self.act_view = QAction("Show redacted result", self, checkable=True,
@@ -428,16 +469,19 @@ class MainWindow(QMainWindow):
         self.btn_redact_all.clicked.connect(self.redact_all)
         tb.addWidget(self.btn_redact_all)
 
-        # center: drop zone or page
-        self.page_view = PageView()
-        self.page_view.matchClicked.connect(self.toggle_match)
-        self.page_view.boxDrawn.connect(self.add_box)
-        self.page_view.boxRemoveRequested.connect(self.remove_box)
-        self.page_view.termRegionSelected.connect(self.add_term_from_region)
+        # center: drop zone or pages (the current one, or all in continuous scroll)
+        self.pages = QWidget()
+        self.pages.setObjectName("pages")
+        self.pages.setStyleSheet("#pages { background: #5a5a5a; }")
+        self.pages_layout = QVBoxLayout(self.pages)
+        self.pages_layout.setContentsMargins(PAGE_GAP, PAGE_GAP, PAGE_GAP, PAGE_GAP)
+        self.pages_layout.setSpacing(PAGE_GAP)
+        self.pages_layout.setAlignment(Qt.AlignTop)
         self.scroll = QScrollArea()
-        self.scroll.setWidget(self.page_view)
+        self.scroll.setWidget(self.pages)
         self.scroll.setAlignment(Qt.AlignHCenter | Qt.AlignTop)
         self.scroll.setStyleSheet("QScrollArea { background: #5a5a5a; }")
+        self.scroll.verticalScrollBar().valueChanged.connect(self._scrolled)
         self.stack = QStackedWidget()
         self.stack.addWidget(DropZone())
         self.stack.addWidget(self.scroll)
@@ -728,7 +772,7 @@ class MainWindow(QMainWindow):
             return False
         entry = self.entries[index]
         try:
-            doc = open_pdf(entry.path, entry.password, prompt=False)
+            doc = open_pdf(entry.path, entry.password, prompt=False, rotations=entry.rotations)
         except PasswordNeeded as e:
             pw, ok = QInputDialog.getText(self, "Password", f"{e}. Password:", QLineEdit.Password)
             if not ok:
@@ -830,8 +874,7 @@ class MainWindow(QMainWindow):
         self._refresh_file_list()
 
     def _close_docs(self):
-        self.page_view.set_page(None)
-        self._shown = None
+        self._clear_views()
         for d in (self.doc, self.out_doc):
             if d is not None:
                 d.close()
@@ -938,15 +981,17 @@ class MainWindow(QMainWindow):
         kind, ident = item.data(0, Qt.UserRole)
         if kind == "match":
             m = self._match(ident)
-            self.page_view.highlight = m.id
+            self.highlight = m.id
             self.go_page(m.page)
             self.scroll.ensureVisible(*self._center_of(m.rects[0]), 200, 200)
         else:
             self.go_page(self.boxes[ident].page - 1)
 
     def _center_of(self, r: pymupdf.Rect):
-        v = self.page_view.to_view(r)
-        return int(v.center().x()), int(v.center().y())
+        """Center of r on the current page, in the scrolled area's coordinates."""
+        view = self.page_view
+        c = view.to_view(r).center().toPoint() + view.pos()
+        return c.x(), c.y()
 
     def _tree_menu(self, pos):
         item = self.tree.itemAt(pos)
@@ -1029,41 +1074,145 @@ class MainWindow(QMainWindow):
 
     # navigation & display ------------------------------------------------
 
+    @property
+    def page_view(self) -> PageView | None:
+        """The view of the current page."""
+        return self.views[self.page_no] if 0 <= self.page_no < len(self.views) else None
+
     def set_mode(self, mode: str):
-        self.page_view.mode = mode
+        self.mode = mode
+        for v in self.views:
+            v.mode = mode
         self.mode_actions[mode].setChecked(True)
 
     def set_zoom(self, factor: float):
-        self.page_view.zoom = max(0.4, min(4.0, self.page_view.zoom * factor))
+        self.zoom = max(0.4, min(4.0, self.zoom * factor))
         self._refresh_page(rerender=True)
+        if self.continuous:
+            self._scroll_to_page(self.page_no)
+
+    def set_continuous(self, on: bool):
+        self.continuous = on
+        self.act_continuous.setChecked(on)
+        self.settings.setValue("continuous", on)
+        self.go_page(self.page_no)
 
     def go_page(self, n: int):
         doc = self._display_doc()
         if doc is None:
             return
         self.page_no = max(0, min(doc.page_count - 1, n))
-        self._refresh_page(rerender=True)
+        self._refresh_page()
+        if self.continuous:
+            for v in self.views:
+                v.show()
+            self._fit_pages()
+            self._scroll_to_page(self.page_no)
+        else:
+            for v in self.views:
+                v.setVisible(v.page_no == self.page_no)
+                if v.page_no != self.page_no:
+                    v.image = None
+            self._fit_pages()
+        self._update_page_label()
 
     def _display_doc(self):
         return self.out_doc if self.showing_output and self.out_doc else self.doc
 
+    def _clear_views(self):
+        for v in self.views:
+            v.page = None  # its document may be closing
+            self.pages_layout.removeWidget(v)
+            v.deleteLater()
+        self.views = []
+        self._shown_doc = None
+
+    def _build_views(self, doc: pymupdf.Document):
+        self._clear_views()
+        overlays = not self.showing_output
+        for pno in range(doc.page_count):
+            v = PageView(pno)
+            v.zoom, v.mode, v.highlight = self.zoom, self.mode, self.highlight
+            v.can_render = lambda: self.worker is None
+            v.setVisible(self.continuous or pno == self.page_no)
+            v.set_page(doc[pno], overlays)
+            v.pressed.connect(self._view_pressed)
+            v.matchClicked.connect(self.toggle_match)
+            v.boxDrawn.connect(self.add_box)
+            v.boxRemoveRequested.connect(self.remove_box)
+            v.termRegionSelected.connect(self.add_term_from_region)
+            self.pages_layout.addWidget(v, 0, Qt.AlignHCenter)
+            self.views.append(v)
+        self._shown_doc = doc
+        self._fit_pages()
+
+    def _fit_pages(self):
+        """Resize the page column to the shown pages (after any size change)."""
+        self.pages_layout.activate()
+        self.pages.adjustSize()
+
+    def _scroll_to_page(self, n: int):
+        if 0 <= n < len(self.views):
+            self._fit_pages()
+            self.scroll.verticalScrollBar().setValue(self.views[n].y() - PAGE_GAP)
+            self.page_no = n  # the scroll may have picked a neighbour
+
+    def _scrolled(self, value: int):
+        """In continuous scroll: track the current page, free far-off images."""
+        if not self.continuous or not self.views:
+            return
+        height = self.scroll.viewport().height()
+        middle = value + height // 2
+        current = self.page_no
+        for v in self.views:
+            if v.y() - PAGE_GAP <= middle < v.y() + v.height():
+                current = v.page_no
+            if v.image is not None and (v.y() + v.height() < value - height
+                                        or v.y() > value + 2 * height):
+                v.image = None
+        if current != self.page_no:
+            self.page_no = current
+            self._update_page_label()
+
+    def _view_pressed(self, page_no: int):
+        """A click on a page makes it the current page (for boxes, terms)."""
+        if page_no != self.page_no:
+            self.page_no = page_no
+            self._update_page_label()
+
     def _refresh_page(self, rerender: bool = False):
+        """Bring the page views up to date with the shown document and choices."""
         doc = self._display_doc()
         if doc is None:
             return
-        pv = self.page_view
-        shown = (id(doc), self.page_no)
-        if rerender or getattr(self, "_shown", None) != shown:
-            pv.set_page(doc[self.page_no], overlays=not self.showing_output)
-            self._shown = shown
-        pv.matches = [m for m in self.matches if m.page == self.page_no]
-        pv.kept = self.kept_ids()
-        pv.boxes = [b for b in self.boxes if b.page == self.page_no + 1] + \
-                   [b for b in self.cfg.boxes if b.page == self.page_no + 1]
-        pv.box_indices = [i for i, b in enumerate(self.boxes) if b.page == self.page_no + 1] + \
-                         [-1] * sum(b.page == self.page_no + 1 for b in self.cfg.boxes)
-        pv.update()
-        on_page = len(pv.matches)
+        if doc is not self._shown_doc:
+            self._build_views(doc)
+        elif rerender:
+            for v in self.views:
+                v.zoom = self.zoom
+                v.render()
+            self._fit_pages()
+        kept = self.kept_ids()
+        by_page: dict[int, list[Match]] = {}
+        for m in self.matches:
+            by_page.setdefault(m.page, []).append(m)
+        for v in self.views:
+            n = v.page_no + 1
+            mine = [(i, b) for i, b in enumerate(self.boxes) if b.page == n]
+            from_cfg = [b for b in self.cfg.boxes if b.page == n]
+            v.matches = by_page.get(v.page_no, [])
+            v.kept = kept
+            v.boxes = [b for _i, b in mine] + from_cfg
+            v.box_indices = [i for i, _b in mine] + [-1] * len(from_cfg)
+            v.highlight = self.highlight
+            v.update()
+        self._update_page_label()
+
+    def _update_page_label(self):
+        doc = self._display_doc()
+        if doc is None:
+            return
+        on_page = sum(m.page == self.page_no for m in self.matches)
         self.page_label.setText(
             f"  Page {self.page_no + 1} / {doc.page_count}"
             + ("  (redacted)" if self.showing_output else f"  · {on_page} here") + "  ")
@@ -1071,24 +1220,71 @@ class MainWindow(QMainWindow):
 
     def toggle_output_view(self, on: bool):
         self.showing_output = on and self.out_doc is not None
-        self._refresh_page(rerender=True)
+        self.go_page(self.page_no)
+
+    def rotate_page(self, degrees: int, page_no: int | None = None):
+        """Turn a page (default: the current one) clockwise by degrees.
+
+        The turn is kept with the file's review choices and is applied to
+        the redacted PDF, the review copy and batch redaction. A page read
+        with OCR is read again, since OCR depends on the page's orientation.
+        """
+        if self.doc is None or self.current is None or self.worker is not None:
+            return
+        pno = self.page_no if page_no is None else page_no
+        entry = self.entries[self.current]
+        turned = (entry.rotations.get(pno, 0) + degrees) % 360
+        if turned:
+            entry.rotations[pno] = turned
+        else:
+            entry.rotations.pop(pno, None)
+        self._invalidate_output()  # also switches back to the original
+        self._refresh_page()
+        page = self.doc[pno]
+        page.set_rotation((page.rotation + degrees) % 360)
+        self.views[pno].set_page(page, overlays=True)
+        self.go_page(pno)
+        texts = getattr(self, "page_texts", None)
+        if texts and texts[pno].ocr:
+            self._reread_page(pno)
+
+    def _reread_page(self, pno: int):
+        doc, cfg, texts = self.doc, self.cfg, list(self.page_texts)
+
+        def work(progress):
+            progress("Reading the turned page again", 0, 1)
+            texts[pno] = read_page(doc[pno], cfg)
+            matches = find_matches(doc, cfg, texts=texts)
+            return matches, page_warnings(doc, cfg), texts
+
+        self.run_task("Scanning", work, self._scan_done)
 
     def _invalidate_output(self):
         """The redacted file no longer reflects the current choices."""
-        if self.out_doc is not None:
-            self.out_doc.close()
-            self.out_doc = None
-        if self.showing_output:
-            self.showing_output = False
-            self.act_view.setChecked(False)
+        self._drop_out_doc()
         if self.output is not None and self.result_bar.isVisible():
             self.result_label.setText(
                 "<span style='color:#a15c00'>You changed something since redacting. "
                 "Redact again to update the file.</span>")
 
+    def _drop_out_doc(self):
+        """Close the redacted output (e.g. before it's rewritten), showing
+        the original instead if it was on screen."""
+        showing = self.showing_output
+        if showing:
+            self.showing_output = False
+            self.act_view.setChecked(False)
+        if self.out_doc is not None:
+            self.out_doc.close()
+            self.out_doc = None
+        if showing or (self._shown_doc is not None and self._shown_doc is not self.doc):
+            self._clear_views()  # they show pages of the closed document
+            self.go_page(self.page_no)
+
     def _update_enabled(self):
         loaded = self.doc is not None
         for a in (self.act_prev, self.act_next, self.act_zoom_in, self.act_zoom_out,
+                  self.act_rotate_left, self.act_rotate_right, self.act_continuous,
                   self.act_review, *self.mode_actions.values()):
             a.setEnabled(loaded)
         self.btn_redact.setEnabled(loaded)
@@ -1113,15 +1309,13 @@ class MainWindow(QMainWindow):
         """Redact to out in the background; the result shows when done."""
         if out.suffix.lower() != ".pdf":
             out = out.with_suffix(".pdf")
-        if self.out_doc is not None:  # may be the file being overwritten
-            self.out_doc.close()
-            self.out_doc = None
-            self.showing_output = False
+        self._drop_out_doc()  # may be the file being overwritten
         args = (self.src, out, self.cfg, self.matches, self.kept_ids(),
                 list(self.boxes), self.password)
+        rotations = dict(self.entries[self.current].rotations) if self.current is not None else {}
 
         def work(progress):
-            return redact_file(*args, progress=progress)
+            return redact_file(*args, progress=progress, rotations=rotations)
 
         self.run_task("Redacting", work, lambda result: self._redact_done(out, result))
 
@@ -1180,13 +1374,11 @@ class MainWindow(QMainWindow):
         """Redact every file in the list into folder, in parallel processes."""
         self._store_current()
         outs = output_paths([e.path for e in self.entries], folder)
-        jobs = [BatchJob(i, e.path, out, e.password, set(e.kept_keys), list(e.boxes))
+        jobs = [BatchJob(i, e.path, out, e.password, set(e.kept_keys), list(e.boxes),
+                         dict(e.rotations))
                 for i, (e, out) in enumerate(zip(self.entries, outs))]
         cfg = self.cfg
-        if self.out_doc is not None:  # its file may be overwritten
-            self.out_doc.close()
-            self.out_doc = None
-            self.showing_output = False
+        self._drop_out_doc()  # its file may be overwritten
         self.run_task("Redacting all files", lambda progress: run_batch(jobs, cfg, progress),
                       lambda results: self._batch_done(folder, results))
 
@@ -1260,6 +1452,8 @@ class MainWindow(QMainWindow):
             self.centralWidget().setEnabled(True)
             self.toolbar.setEnabled(True)
             self._update_enabled()
+            for v in self.views:  # pages skipped while the worker ran
+                v.update()
 
         def succeeded(result):
             finish()
@@ -1302,7 +1496,8 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Review copy", "Choose a different file than the original.")
             return
         write_review_pdf(self.src, out, self.matches, self.kept_ids(),
-                         [*self.cfg.boxes, *self.boxes], self.password)
+                         [*self.cfg.boxes, *self.boxes], self.password,
+                         rotations=self.entries[self.current].rotations)
         QMessageBox.information(
             self, "Review copy saved",
             f"Saved {out.name}.\n\nIt shows everything UNREDACTED with the planned "

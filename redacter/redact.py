@@ -26,7 +26,9 @@ class PasswordNeeded(RedactError):
 
 
 def open_pdf(path: Path, password: str | None = None,
-             prompt: bool = True) -> pymupdf.Document:
+             prompt: bool = True,
+             rotations: dict[int, int] | None = None) -> pymupdf.Document:
+    """Open and flatten a PDF. rotations turns pages (see rotate_pages)."""
     try:
         doc = pymupdf.open(path)
     except Exception as e:
@@ -45,7 +47,23 @@ def open_pdf(path: Path, password: str | None = None,
     # of fillable forms live in widgets, not page text: without this they are
     # invisible to detection and would survive redaction.
     doc.bake(annots=True, widgets=True)
+    if rotations:
+        rotate_pages(doc, rotations)
     return doc
+
+
+def rotate_pages(doc: pymupdf.Document, rotations: dict[int, int]) -> None:
+    """Turn pages clockwise by the given degrees (0-based page -> multiple of
+    90), on top of the rotation they already have.
+
+    Only the page's /Rotate changes. Text and redaction coordinates are in
+    unrotated page space, so matches found before or after stay valid; only
+    OCR, which reads the page as displayed, depends on the turn.
+    """
+    for pno, degrees in rotations.items():
+        if degrees % 360 and 0 <= pno < doc.page_count:
+            page = doc[pno]
+            page.set_rotation((page.rotation + degrees) % 360)
 
 
 def _drop_broken_objects(doc: pymupdf.Document) -> None:
@@ -248,16 +266,17 @@ def redact_file(
     boxes: list[Box] = (),
     password: str | None = None,
     progress: Progress | None = None,
+    rotations: dict[int, int] | None = None,
 ) -> RedactResult:
     """Write a redacted, verified copy of src to out.
 
     matches defaults to a fresh scan; pass the list a caller already showed
-    the user so its choices (skip IDs) apply. If verification fails, out is
-    deleted and the result lists the leaks.
+    the user so its choices (skip IDs) apply, found with the same rotations.
+    If verification fails, out is deleted and the result lists the leaks.
     """
     if out.resolve() == src.resolve():
         raise RedactError("output must differ from input")
-    doc = open_pdf(src, password, prompt=False)
+    doc = open_pdf(src, password, prompt=False, rotations=rotations)
     if matches is None:
         matches = find_matches(doc, cfg, progress)
     applied = redact_document(doc, matches, cfg, skip, boxes, progress)
@@ -436,6 +455,7 @@ def write_review_pdf(
     skip: set[int] = frozenset(),
     boxes: list[Box] = (),
     password: str | None = None,
+    rotations: dict[int, int] | None = None,
 ) -> None:
     """Write an UNREDACTED copy of src with every planned redaction outlined.
 
@@ -443,7 +463,7 @@ def write_review_pdf(
     boxes; each match is labelled with its ID. Every page is stamped as a
     review copy, since it still contains all the PII.
     """
-    doc = open_pdf(src, password, prompt=False)
+    doc = open_pdf(src, password, prompt=False, rotations=rotations)
     by_page: dict[int, list[Match]] = {}
     for m in matches:
         by_page.setdefault(m.page, []).append(m)

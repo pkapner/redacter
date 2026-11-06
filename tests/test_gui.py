@@ -158,3 +158,108 @@ def test_scanned_page_in_app_uses_ocr(win, tmp_path, monkeypatch):
         assert offered == ["Premium before"]
     finally:
         ocr.set_engine(None)
+
+
+def make_pages(path, n):
+    """n copies of the fake return's page in one PDF."""
+    one = pymupdf.open(make_return(path.with_name("one.pdf")))
+    doc = pymupdf.open()
+    for _ in range(n):
+        doc.insert_pdf(one)
+    doc.save(path)
+    return path
+
+
+def test_rotated_page_is_redacted_and_saved_turned(win, tmp_path, monkeypatch):
+    src = make_return(tmp_path / "return.pdf")
+    win.load_pdf(src)
+    win.wait_idle()
+    before = len(win.matches)
+    win.rotate_page(90)
+    win.rotate_page(90)
+    win.rotate_page(-90)
+    assert win.entries[0].rotations == {0: 90}
+    assert win.page_view.width() > win.page_view.height()  # shown landscape
+    assert len(win.matches) == before  # text layer: nothing to re-read
+
+    out = tmp_path / "out.pdf"
+    win.redact_to(out)
+    win.wait_idle()
+    assert pymupdf.open(out)[0].rotation == 90
+    text = all_text(out)
+    assert SSN not in text and "JANE" not in text
+    assert "Do not redact" in text
+
+    review = tmp_path / "review.pdf"
+    monkeypatch.setattr(QtWidgets.QFileDialog, "getSaveFileName",
+                        lambda *a, **k: (str(review), ""))
+    monkeypatch.setattr(QtWidgets.QMessageBox, "information", lambda *a, **k: None)
+    win.save_review()
+    assert pymupdf.open(review)[0].rotation == 90
+
+
+def test_rotation_applies_in_batch(win, tmp_path):
+    srcs = [make_return(tmp_path / f"return{i}.pdf") for i in range(2)]
+    win.add_files(srcs)
+    win.wait_idle()
+    win.rotate_page(270)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    win.redact_all_to(out_dir)
+    win.wait_idle(120000)
+    assert pymupdf.open(out_dir / "return0.redacted.pdf")[0].rotation == 270
+    assert pymupdf.open(out_dir / "return1.redacted.pdf")[0].rotation == 0
+
+
+def test_rotating_scanned_page_reads_it_again(win, tmp_path):
+    from redacter import ocr
+    from test_ocr import fake_engine, make_scan
+
+    path = tmp_path / "scan.pdf"
+    truth, rect = make_scan(path)
+    engine = fake_engine(truth, rect)
+    calls = []
+    ocr.set_engine(lambda png: (calls.append(1), engine(png))[1])
+    try:
+        win.load_pdf(path)
+        win.wait_idle()
+        assert len(calls) == 1
+        win.rotate_page(180)
+        win.wait_idle()
+        assert len(calls) == 2
+        assert win.page_texts[0].ocr
+    finally:
+        ocr.set_engine(None)
+
+
+def test_continuous_scroll(win, tmp_path):
+    win.resize(1000, 700)
+    win.load_pdf(make_pages(tmp_path / "pages.pdf", 4))
+    win.wait_idle()
+    assert [v.isVisible() for v in win.views] == [True, False, False, False]
+
+    win.set_continuous(True)
+    assert all(v.isVisible() for v in win.views)
+    win.go_page(2)
+    assert win.page_no == 2
+    bar = win.scroll.verticalScrollBar()
+    assert bar.value() == win.views[2].y() - 12
+
+    # scrolling moves the current page; a click picks its page for boxes
+    bar.setValue(win.views[1].y())
+    assert win.page_no == 1
+    v = win.views[3]
+    win.set_mode("box")
+    a = v.to_view(pymupdf.Rect(40, 305, 300, 325))
+    QTest.mousePress(v, Qt.LeftButton, pos=a.topLeft().toPoint())
+    QTest.mouseMove(v, a.bottomRight().toPoint())
+    QTest.mouseRelease(v, Qt.LeftButton, pos=a.bottomRight().toPoint())
+    assert win.page_no == 3 and win.boxes[-1].page == 4
+
+    # only pages near the viewport keep a rendered image
+    bar.setValue(0)
+    win.repaint()
+    assert win.views[0].image is not None and win.views[3].image is None
+
+    win.set_continuous(False)
+    assert [v.isVisible() for v in win.views].count(True) == 1
