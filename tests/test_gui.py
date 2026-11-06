@@ -9,7 +9,7 @@ import pytest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 QtWidgets = pytest.importorskip("PySide6.QtWidgets")
 
-from PySide6.QtCore import Qt  # noqa: E402
+from PySide6.QtCore import QSettings, Qt  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 
 from redacter.gui import MainWindow  # noqa: E402
@@ -27,10 +27,20 @@ def win(app, tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
     cfg = tmp_path / "redact.toml"
     cfg.write_text('terms = ["Jane Q", "Doe", "123 Main Street"]\n')
+    # macOS keeps QSettings outside HOME: leave the user's own settings (and
+    # the next test's) as they were
+    settings = QSettings("redacter", "redacter")
+    saved = {k: settings.value(k) for k in ("continuous", "config_path")}
     w = MainWindow(config_path=cfg)
+    w.set_continuous(False)
     w.show()
     yield w
     w.close()
+    for k, v in saved.items():
+        if v is None:
+            settings.remove(k)
+        else:
+            settings.setValue(k, v)
 
 
 def test_load_toggle_box_and_redact(win, tmp_path):
